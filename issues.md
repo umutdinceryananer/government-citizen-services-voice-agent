@@ -1691,3 +1691,73 @@ Fix: shared-secret header check. Citizen-data routes require X-Internal-Key (INT
 - [x] The three read-only routes answer without a key
 - [x] The public app (agent/server.py) enforces the same rules
 - [x] Every node helper passes the key check end-to-end (tests/test_api_security.py, 60 tests)
+
+---
+
+# ISSUE-45: Replace Plain SHA-256 with Keyed Hashes
+
+## Module
+Security
+
+## Priority
+P0 (high severity)
+
+## Dependencies
+ISSUE-05, ISSUE-05B
+
+## Description
+Citizen.tc_kimlik_hash and AuthAuditLog.citizen_id_hash held plain SHA-256 values. A TC Kimlik has 11 digits, two of them check digits, so there are ~900 million valid numbers — anyone with a copy of the database could recover every number by hashing all valid values (minutes on one GPU).
+
+verify_webhook had no column to match the last four digits against. It imported generate_valid_tc and SEED_CITIZENS from api/seed_data.py, regenerated full numbers and compared them, so webhook auth worked only for seeded citizens and the auth code depended on seed data.
+
+Fix: HMAC-SHA256 under a secret pepper (ID_HASH_PEPPER) for every stored identifier, plus an indexed tc_last4_hash column for the webhook lookup.
+
+## Tasks
+- [x] api/crypto.py — `keyed_hash(value)`: HMAC-SHA256 under ID_HASH_PEPPER, refuses to run when the pepper is missing or shorter than 32 characters
+- [x] keyed_hash for Citizen.tc_kimlik_hash and every AuthAuditLog hash (tc-kimlik and app-ref flows); readers updated
+- [x] Citizen.tc_last4_hash column — keyed hash of the last four digits, indexed, not unique
+- [x] verify_webhook queries tc_last4_hash + date_of_birth, then father initial; more than one match is a failure; no imports from api/seed_data.py
+- [x] api/seed_data.py fills both hash columns with keyed_hash; refuses to run against an old citizens table with a clear message
+- [x] README setup: delete data/citizens.db and reseed (no migration, create_all does not add columns)
+- [x] ID_HASH_PEPPER= added to .env.example; agent/server.py logs an error at startup if the pepper is missing/weak
+
+## Acceptance Criteria
+- [x] keyed_hash is deterministic per pepper and differs with another pepper
+- [x] A seeded citizen authenticates through verify_webhook (all 23 seed citizens, via the real seed() path) and api/auth.py no longer imports api/seed_data.py
+- [x] A citizen created inside a test, outside the seed data, can authenticate
+- [x] No plain hashlib.sha256 call left for identifiers in api/ (enforced by a test; only api/crypto.py imports hashlib)
+- [x] Full test suite passes (no new failures; tests/test_identity_hashing.py, 44 tests)
+
+---
+
+# ISSUE-46: Harden the Authentication Endpoints
+
+## Module
+Security
+
+## Priority
+P0 (high severity)
+
+## Dependencies
+ISSUE-45
+
+## Description
+POST /auth/verify/webhook accepted calls from anyone, had no server-side attempt limit (a direct caller knowing a birth date and father initial could try all 10,000 last-4 values), wrote no audit record, and returned nothing the backend could verify later. /auth/verify/tc-kimlik and /auth/verify/app-ref returned different messages for an unknown ID, a wrong birth date and a wrong last name, revealing which IDs and application references exist.
+
+## Tasks
+- [x] Every /auth route requires `Authorization: Bearer <PLATFORM_WEBHOOK_SECRET>` (hmac.compare_digest, 403 on missing/wrong header, fail closed when unset)
+- [x] Server-side attempt limit in verify_webhook: new body fields conversation_id (required) and caller_number (optional); 3 failures per conversation_id and per keyed hash of caller_number in 15 minutes, then 429. In-memory, per process — comment notes production needs a shared store
+- [x] One generic failure message for every failure, in the call language (optional `language` field, tr/en); specific reason only in the audit record
+- [x] AuthAuditLog row for every webhook attempt: conversation_id, attempt number, outcome, category (format / no_match / locked), keyed hash of the citizen id on success; never the factors (old factor-printing log line removed too)
+- [x] /auth/verify/tc-kimlik and /auth/verify/app-ref removed with their tests — the voice flow never called them
+- [x] agent/session_token.py — HMAC-signed token bound to citizen id + conversation id; verify_webhook returns `session_token` next to the existing fields
+- [x] PLATFORM_WEBHOOK_SECRET= and SESSION_TOKEN_SECRET= added to .env.example; startup warnings/errors when missing
+- [ ] Manual (ElevenLabs dashboard): dispatch tool header `Authorization: Bearer <secret>` (workspace secret / secret__ variable), body fields conversation_id ← {{system__conversation_id}} and caller_number ← {{system__caller_id}}, assignment response.session_token → session_token
+
+## Acceptance Criteria
+- [x] No header or a wrong header returns 403
+- [x] The fourth failed attempt in one conversation returns 429, and so does a new conversation from the same caller number
+- [x] Failure responses are identical for an unknown ID, a wrong birth date and a wrong initial (and for format errors, in TR and EN)
+- [x] One audit row per attempt; no row contains a factor value
+- [x] A success response contains a session_token that agent.session_token.verify accepts
+- [x] Full test suite passes (no new failures; tests/test_auth.py 35 + tests/test_session_token.py 18)

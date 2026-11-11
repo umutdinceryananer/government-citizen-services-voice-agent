@@ -80,7 +80,9 @@ Citizens must verify their identity before accessing personal information. The s
 - **Date of birth**: day, month, year
 - **Father's name initial**: single letter
 
-The authentication flow follows ElevenLabs' Workflow best practices for secure caller identity verification: a deterministic dispatch tool (webhook) routes to authenticated or retry subagent based on boolean result, no LLM inference involved in the auth decision. KVKK (Turkish GDPR) compliant: PII redaction in all logs, TC Kimlik stored as SHA-256 hash, audit trail with no raw PII.
+The authentication flow follows ElevenLabs' Workflow best practices for secure caller identity verification: a deterministic dispatch tool (webhook) routes to authenticated or retry subagent based on boolean result, no LLM inference involved in the auth decision. KVKK (Turkish GDPR) compliant: PII redaction in all logs, TC Kimlik stored only as a keyed HMAC-SHA256 hash (secret pepper kept outside the database, so a stolen copy cannot be brute-forced), audit trail with no raw PII.
+
+The verification webhook answers only the ElevenLabs platform (shared bearer secret), limits failed attempts on the server (3 per conversation and per caller number in 15 minutes), returns one generic failure message so a caller cannot tell which factor was wrong, audits every attempt without storing the factors, and returns a signed session token that the backend can verify later.
 
 ### 4. Graceful Degradation
 
@@ -264,7 +266,7 @@ This is a demo, but the architecture is designed with production deployment in m
 - **Horizontal scaling**: FastAPI backend and LangGraph agent are stateless per-request, can scale behind a load balancer
 - **Knowledge base updates**: re-indexing pipeline allows document updates without downtime
 - **Multi-tenant architecture**: the same system can serve multiple government agencies with isolated knowledge bases and authentication backends
-- **Compliance**: CORS policy, security headers (OWASP), rate limiting, API-key guard on every citizen-data route (separate admin key for erasure), GDPR right to erasure, PII redaction, SHA-256 hashed credentials, audit trail. ElevenLabs platform holds SOC 2 Type II, ISO 27001, HIPAA, and GDPR certifications ([elevenlabs.io](https://compliance.elevenlabs.io/))
+- **Compliance**: CORS policy, security headers (OWASP), rate limiting, API-key guard on every citizen-data route (separate admin key for erasure), GDPR right to erasure, PII redaction, keyed HMAC-SHA256 hashed identifiers, audit trail. ElevenLabs platform holds SOC 2 Type II, ISO 27001, HIPAA, and GDPR certifications ([elevenlabs.io](https://compliance.elevenlabs.io/))
 - **Observability**: ConversationLog tracks intent, timing, RAG scores, tool chains, and API calls per request
 
 ## Capabilities Demonstrated
@@ -274,8 +276,8 @@ This project demonstrates the following technical and design patterns:
 1. **Custom LLM integration with voice platforms**: connecting a sophisticated LangGraph backend to ElevenLabs via Custom LLM endpoint, with SSE streaming and system tool forwarding. The pattern is portable to any voice platform that supports custom LLM hooks.
 2. **Deterministic workflow design**: auth gating via dispatch tool plus subagent isolation (no LLM in the auth decision path), LLM condition edges for service routing, backward edges for auth retry. Demonstrates how to combine deterministic guarantees with LLM flexibility.
 3. **Enterprise public sector use case**: voice AI applied to a massive, underserved market with real compliance and security requirements.
-4. **Security-first design**: caller authentication as a core architectural concern. KVKK compliance, PII redaction, SHA-256 hashed credentials, audit trails.
-5. **Full-stack ownership**: voice layer, agent logic, API integrations, knowledge base, analytics dashboard, and 293-test suite, all built end-to-end.
+4. **Security-first design**: caller authentication as a core architectural concern. KVKK compliance, PII redaction, keyed HMAC-SHA256 hashed identifiers, audit trails.
+5. **Full-stack ownership**: voice layer, agent logic, API integrations, knowledge base, analytics dashboard, and 370-test suite, all built end-to-end.
 6. **Multilingual capability**: English plus Turkish with auto-detection and dynamic voice switching. Architecture extensible to additional languages.
 7. **Production resilience**: graceful degradation across three levels with circuit breaker pattern and health monitoring.
 8. **Measurable analytics**: 9-page dashboard with Sankey flow visualization, node-level timing, tool chain analysis, and knowledge gap detection.
@@ -313,12 +315,16 @@ pip install -r requirements.txt
 
 cp .env.example .env
 # Fill in your API keys, see .env.example for required variables
+# (ID_HASH_PEPPER must be at least 32 characters, it keys the stored identity hashes)
 ```
 
 ### Run
 
 ```bash
 # Seed the citizen database (23 citizens, 26 applications, 5 appointments, 3 doc requests)
+# Schema changes are not migrated: if data/citizens.db was created by an older version
+# (or ID_HASH_PEPPER changed), delete it first, then seed. This also clears dashboard history.
+rm -f data/citizens.db     # PowerShell: Remove-Item data\citizens.db -ErrorAction SilentlyContinue
 python -m api.seed_data
 
 # Start the server (single server, gov API mounted into agent server)
@@ -334,7 +340,7 @@ python -m agent.deploy --dry-run  # Preview config without deploying
 # Run analytics dashboard
 python -m streamlit run dashboard/app.py
 
-# Run tests (293 tests)
+# Run tests (370 tests)
 python -m pytest tests/ -v
 ```
 
@@ -348,6 +354,7 @@ Government-Citizen-Services-Voice-Agent/
 │   ├── graph.py                       # LangGraph StateGraph definition (11 nodes)
 │   ├── logging_config.py              # PII redaction logging (KVKK compliance)
 │   ├── server.py                      # Custom LLM proxy, SSE streaming, circuit breaker, analytics logging
+│   ├── session_token.py               # Signed session tokens (HMAC) issued on successful auth
 │   ├── state.py                       # AgentState TypedDict (incl. node detail tracking)
 │   ├── nodes/                         # Graph node implementations
 │   │   ├── intent_classify.py         # LLM-based intent classification (10 intents, GPT-4o)
@@ -374,10 +381,11 @@ Government-Citizen-Services-Voice-Agent/
 │       └── schemas.py                 # ElevenLabs system tool configs (end_call, language_detection)
 ├── api/                               # Government backend (mounted into agent/server.py)
 │   ├── server.py                      # Standalone FastAPI app (for independent testing)
-│   ├── auth.py                        # Identity verification, webhook, TC Kimlik, app ref methods
+│   ├── auth.py                        # Identity verification webhook: platform secret, attempt limit, audit, session token
 │   ├── handoff.py                     # Escalation logging + guest mode FAQ
 │   ├── services.py                    # Application, appointment, document, service catalog endpoints
 │   ├── security.py                    # X-Internal-Key / X-Admin-Key guards for citizen-data routes
+│   ├── crypto.py                      # keyed_hash(): HMAC-SHA256 under ID_HASH_PEPPER for stored identifiers
 │   ├── models.py                      # SQLAlchemy models (Citizen, Application, Appointment, DocumentRequest, ConversationLog, AuthAuditLog)
 │   └── seed_data.py                   # 23 citizens + 26 applications + 5 appointments + 3 doc requests
 ├── rag/                               # RAG pipeline
@@ -395,14 +403,16 @@ Government-Citizen-Services-Voice-Agent/
 │   ├── auth_flow.md                   # Authentication state diagram
 │   ├── conversation_flow.md           # Conversation flow documentation
 │   └── langgraph_value.md             # LangGraph capabilities and voice test scenarios
-├── tests/                             # 293 tests
+├── tests/                             # 370 tests
 │   ├── conftest.py                    # Shared test DB setup, per-test audit log cleanup
 │   ├── test_core_system.py            # Comprehensive core system tests (104 tests, all product endings)
-│   ├── test_auth.py                   # Authentication flow tests (20 tests)
+│   ├── test_auth.py                   # Auth webhook: platform secret, attempt limit, generic failures, audit, token
+│   ├── test_session_token.py          # Session token signing, expiry, tampering, conversation binding
 │   ├── test_services.py               # Government API endpoint tests
 │   ├── test_edge_cases.py             # TC Kimlik normalization, date parsing edge cases
 │   ├── test_handoff.py                # Escalation and handoff tests
 │   ├── test_api_security.py           # API key guards on government routes (internal + admin keys)
+│   ├── test_identity_hashing.py       # Keyed hashes, seed data, webhook auth for any citizen
 │   ├── test_schemas.py                # System tool schema tests
 │   ├── test_logging.py                # PII redaction filter tests
 │   ├── test_tc_kimlik.py              # TC Kimlik validator tests

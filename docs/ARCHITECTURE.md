@@ -241,6 +241,7 @@ erDiagram
     Citizen {
         int id PK
         string tc_kimlik_hash UK
+        string tc_last4_hash
         string first_name
         string last_name
         string father_name

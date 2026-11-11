@@ -6,17 +6,18 @@ Usage:
     python -m api.seed_data --reset  # Drop and recreate tables, then seed
 
 TC Kimlik numbers use valid checksums. All PII is fictional.
+Identifiers are stored as keyed hashes (api/crypto.py) — ID_HASH_PEPPER must be set.
+
+Schema changes are not migrated: if the citizens table predates a column,
+delete data/citizens.db and run this again.
 """
 
 import argparse
-import hashlib
 
+from sqlalchemy import inspect
+
+from api.crypto import keyed_hash
 from api.models import Base, Citizen, Application, Appointment, DocumentRequest, Office, SessionLocal, engine, init_db
-
-
-def hash_tc(tc_kimlik: str) -> str:
-    """SHA-256 hash a TC Kimlik for storage."""
-    return hashlib.sha256(tc_kimlik.encode()).hexdigest()
 
 
 def generate_valid_tc(first_9: str) -> str:
@@ -171,6 +172,16 @@ def seed(reset: bool = False):
     DocumentRequest). Analytics tables (ConversationLog, AuthAuditLog) are
     preserved to retain conversation history and dashboard data.
     """
+    # create_all never adds columns to an existing table — catch an old schema
+    # here with a clear message instead of an SQL "no such column" error.
+    inspector = inspect(engine)
+    if inspector.has_table("citizens"):
+        columns = {c["name"] for c in inspector.get_columns("citizens")}
+        if "tc_last4_hash" not in columns:
+            print("citizens table is from an older schema (no tc_last4_hash column).")
+            print("Delete data/citizens.db and run `python -m api.seed_data` again.")
+            return
+
     if reset:
         db = SessionLocal()
         db.query(DocumentRequest).delete()
@@ -200,7 +211,8 @@ def seed(reset: bool = False):
             tc_kimlik = generate_valid_tc(first_9)
 
             citizen = Citizen(
-                tc_kimlik_hash=hash_tc(tc_kimlik),
+                tc_kimlik_hash=keyed_hash(tc_kimlik),
+                tc_last4_hash=keyed_hash(tc_kimlik[-4:]),
                 first_name=first_name,
                 last_name=last_name,
                 father_name=father_name,

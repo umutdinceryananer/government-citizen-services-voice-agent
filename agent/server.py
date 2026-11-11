@@ -159,6 +159,8 @@ from api.services import (
 )
 from api.twilio_webhook import router as twilio_router
 from api.models import init_db
+from api.crypto import keyed_hash
+from agent import session_token
 
 app.include_router(auth_router)
 app.include_router(handoff_router)
@@ -179,6 +181,16 @@ def _init_gov_db():
             "INTERNAL_API_KEY is not set — government API will refuse every "
             "citizen-data request, so service nodes cannot reach it"
         )
+    if not os.getenv("PLATFORM_WEBHOOK_SECRET"):
+        logger.warning(
+            "PLATFORM_WEBHOOK_SECRET is not set — /auth routes will refuse every "
+            "request, so callers cannot authenticate"
+        )
+    for check in (lambda: keyed_hash("startup-check"), lambda: session_token.issue(0, "startup-check")):
+        try:
+            check()
+        except RuntimeError as e:
+            logger.error(f"{e} — identity verification will fail until it is set")
 
 
 # --- Request model (OpenAI Chat Completions format) ---

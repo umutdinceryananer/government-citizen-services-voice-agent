@@ -38,7 +38,9 @@ class Citizen(Base):
     __tablename__ = "citizens"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    tc_kimlik_hash = Column(String, nullable=False, unique=True, index=True)
+    # Keyed HMAC-SHA256 hashes (api/crypto.py) — never plain SHA-256
+    tc_kimlik_hash = Column(String, nullable=False, unique=True, index=True)  # full 11 digits
+    tc_last4_hash = Column(String, nullable=False, index=True)  # last 4 digits, webhook auth (not unique)
     first_name = Column(String, nullable=False)
     last_name = Column(String, nullable=False)
     father_name = Column(String, nullable=False, default="")
@@ -67,18 +69,21 @@ class Application(Base):
 
 
 class AuthAuditLog(Base):
-    """Audit trail for authentication attempts. No raw PII stored."""
+    """Audit trail for authentication attempts and handoffs.
+
+    No raw PII and never the auth factors (last 4 digits, DOB, father initial).
+    """
 
     __tablename__ = "auth_audit_log"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-    session_id = Column(String, nullable=False, index=True)
-    method = Column(String, nullable=False)  # "tc_kimlik_dob" or "app_ref_lastname"
+    session_id = Column(String, nullable=False, index=True)  # ElevenLabs conversation id
+    method = Column(String, nullable=False)  # "webhook_last4_dob_father" or "handoff"
     attempt_number = Column(Integer, nullable=False)
-    result = Column(String, nullable=False)  # "success" or "failure"
-    citizen_id_hash = Column(String, nullable=True)  # SHA-256 hash, null on failure
-    failure_reason = Column(String, nullable=True)
+    result = Column(String, nullable=False)  # "success" / "failure" (auth), "transferred" (handoff)
+    citizen_id_hash = Column(String, nullable=True)  # keyed HMAC-SHA256 (api/crypto.py), null on failure
+    failure_reason = Column(String, nullable=True)  # auth: "format" / "no_match" / "locked"; handoff: reason
 
 
 class Appointment(Base):

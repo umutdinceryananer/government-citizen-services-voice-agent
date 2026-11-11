@@ -37,7 +37,7 @@ ElevenLabs Workflow (visual routing):
 
 Single FastAPI server (agent/server.py, port 8080):
 ├─ /v1/chat/completions — Custom LLM proxy (ElevenLabs → LangGraph → SSE)
-├─ /auth/*              — Government auth endpoints (mounted from api/)
+├─ /auth/verify/webhook — Identity verification for the dispatch tool (Bearer PLATFORM_WEBHOOK_SECRET)
 ├─ /applications*       — Application status (X-Internal-Key)
 ├─ /appointments/*      — Appointment endpoints (X-Internal-Key; /appointments/slots/* public)
 ├─ /documents/*         — Document request endpoints (X-Internal-Key)
@@ -57,13 +57,15 @@ Single FastAPI server (agent/server.py, port 8080):
   deploy.py         — Programmatic agent deploy to ElevenLabs (conversation config, workflow preserved)
   graph.py          — LangGraph StateGraph definition
   logging_config.py — PII redaction logging
+  session_token.py  — issue(citizen_id, conversation_id) / verify(token, conversation_id=None) → claims | None; HMAC-SHA256 under SESSION_TOKEN_SECRET, 1h TTL
   server.py         — Custom LLM proxy + mounted gov API (/v1/chat/completions SSE, circuit breaker)
   state.py          — AgentState TypedDict (incl. node detail tracking fields)
 /api                — Government backend (mounted into agent/server.py)
-  auth.py           — POST /auth/verify/tc-kimlik, /auth/verify/app-ref, /auth/verify/webhook
+  auth.py           — POST /auth/verify/webhook only (platform bearer secret, AttemptLimiter 3/15min per conversation + caller, generic failure, audit per attempt, session_token); matches tc_last4_hash + DOB + father initial, exactly one match
+  crypto.py         — keyed_hash(): HMAC-SHA256 under ID_HASH_PEPPER (>= 32 chars) for every stored identifier
   handoff.py        — router (internal key): POST /handoff; guest_router (public): POST /guest/info
-  models.py         — SQLAlchemy models (Citizen, Application, AuthAuditLog, Appointment, DocumentRequest, ConversationLog)
-  seed_data.py      — 23 citizen records + 26 applications + 5 appointments + 3 doc requests seeder
+  models.py         — SQLAlchemy models (Citizen [tc_kimlik_hash, tc_last4_hash], Application, AuthAuditLog, Appointment, DocumentRequest, ConversationLog)
+  seed_data.py      — 23 citizen records + 26 applications + 5 appointments + 3 doc requests seeder (keyed hashes; refuses old schema)
   security.py       — require_internal_key (X-Internal-Key) / require_admin_key (X-Admin-Key) dependencies, hmac.compare_digest, fail closed
   services.py       — router (internal key): GET /applications/{ref}, GET /applications, POST /appointments, GET /appointments/{citizen_id}, DELETE /appointments/{id}, POST /documents/request, GET /documents/{citizen_id}; public_router: GET /services, GET /appointments/slots/{service_type}; admin_router: DELETE /citizens/{id}
   server.py         — Standalone FastAPI app (for independent testing)
@@ -76,9 +78,12 @@ Single FastAPI server (agent/server.py, port 8080):
   insights.py       — LLM-powered recommendation engine (GPT-4o + ElevenLabs docs RAG)
 /data               — citizens.db (SQLite, gitignored), knowledge_base/ (40 docs + manifest.json)
 /docs               — auth_flow.md, conversation_flow.md
-/tests              — Unit, integration, edge case, and live API tests (293 tests)
+/tests              — Unit, integration, edge case, and live API tests (370 tests)
+  test_auth.py      — Auth webhook: 403 secret, 429 limits, identical failures, audit rows without factors, token, PII safety
+  test_session_token.py — token round trip, expiry, tampering, wrong secret, conversation binding
   test_core_system.py — Comprehensive core system tests (104 tests, all product endings)
   test_api_security.py — API key guards: 403 without/wrong key, admin-only erasure, public routes, nodes pass key (60 tests)
+  test_identity_hashing.py — keyed_hash, no plain SHA-256 in api/, seed → webhook auth for all 23 citizens, non-seed citizen auth, ambiguous match (44 tests)
   conftest.py       — Shared test DB setup with per-test audit log cleanup
   voice_e2e_test_roadmap.md — 31 manual voice test scenarios
   /eval             — Automated conversation evaluation (planned)
@@ -89,7 +94,7 @@ Single FastAPI server (agent/server.py, port 8080):
 - **LangGraph for intelligence** — intent routing, tool chaining, state management (what ElevenLabs native can't guarantee)
 - **LangGraph's core differentiator:** deterministic tool chaining (status "additional_docs_needed" → auto RAG query, "rejected" → appeal guidance)
 - **Single multilingual agent** with language_presets — one endpoint, auto language detection
-- **KVKK compliance** — PII redaction in all logs, TC Kimlik stored as SHA-256 hash, audit trail with no raw PII
+- **KVKK compliance** — PII redaction in all logs, TC Kimlik stored only as keyed HMAC-SHA256 (ID_HASH_PEPPER outside the DB — plain SHA-256 of ~900M valid TCs is brute-forceable), audit trail with no raw PII
 - **Prompt versioning** tracked per conversation for data-driven optimization
 - **Workflow visual routing + LangGraph node intelligence** — workflow handles high-level routing between conversation phases, LangGraph handles tool chaining, RAG, API orchestration inside each node
 - **GPT-4o for Service Router** — enables reliable workflow edge transitions. Custom LLM on Service Router causes workflow edges not to trigger
@@ -117,10 +122,12 @@ Single FastAPI server (agent/server.py, port 8080):
 - Shared node utilities in `agent/nodes/utils.py` (mark_completed, gov_api_request)
 - Nodes call the government API only through `gov_api_request()` — it attaches X-Internal-Key; never call `httpx.get/post` against the API directly
 - New citizen-data routes go on the guarded `router` in api/services.py or api/handoff.py; only static/read-only info goes on `public_router` / `guest_router`
+- Hash identifiers only with `api.crypto.keyed_hash()` — never `hashlib.sha256` (a test enforces that only api/crypto.py imports hashlib). New Citizen rows need both `tc_kimlik_hash` and `tc_last4_hash`
 - `load_dotenv()` is called once in `agent/graph.py` — not in individual nodes
-- Tests: `python -m pytest tests/ -v` (293 tests collected)
+- Tests: `python -m pytest tests/ -v` (370 tests collected)
+- Auth webhook tests must send `PLATFORM_AUTH` headers and a `conversation_id`; conftest resets the in-memory `attempt_limiter` before every test
 - Test DB: in-memory SQLite via conftest.py, audit log cleaned per test
-- Test API keys: conftest.py sets INTERNAL_API_KEY / ADMIN_API_KEY to fixed test values (TEST_INTERNAL_KEY / TEST_ADMIN_KEY) — API test clients must send them
+- Test API keys: conftest.py sets INTERNAL_API_KEY / ADMIN_API_KEY / ID_HASH_PEPPER to fixed test values (TEST_INTERNAL_KEY / TEST_ADMIN_KEY / TEST_ID_HASH_PEPPER) — API test clients must send the keys
 - Service nodes report `service_node_name`, `tool_chain_triggered`, `api_calls_count` to state for analytics
 
 ## User Preferences (for Claude)
@@ -142,10 +149,16 @@ pip install -r requirements.txt
 # 2. Configure environment
 cp .env.example .env
 # Fill in: ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID, OPENAI_API_KEY,
-#          INTERNAL_API_KEY, ADMIN_API_KEY (required — gov API refuses all citizen-data requests without INTERNAL_API_KEY)
+#          INTERNAL_API_KEY, ADMIN_API_KEY (required — gov API refuses all citizen-data requests without INTERNAL_API_KEY),
+#          ID_HASH_PEPPER (required, >= 32 chars — auth fails without it),
+#          PLATFORM_WEBHOOK_SECRET (same value goes into the ElevenLabs dispatch tool header),
+#          SESSION_TOKEN_SECRET (>= 32 chars)
 # Generate keys: python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 # 3. Seed the citizen database
+# No migrations: after a schema change or pepper change, delete data/citizens.db first
+# (clears dashboard history too). seed_data refuses to run against an old citizens table.
+Remove-Item data\citizens.db -ErrorAction SilentlyContinue
 python -m api.seed_data
 
 # 4. Start server (single server — gov API mounted into agent server)
@@ -189,7 +202,8 @@ make test-live         # Live API + simulation tests
 ### Auth Workflow (ISSUE-05B) — COMPLETE
 - ElevenLabs Workflow: Start → Collect Identity (GPT-4o-mini + native KB for FAQ) → Dispatch tool (webhook) → Success → Service Router (GPT-4o) → Status Check / Appointment / Document Request / Complaint / Operator Transfer / End. Failure → Auth Retry (GPT-4o-mini) → back to Collect Identity
 - Auth method: TC Kimlik last 4 digits + DOB + father's name initial (STT-friendly)
-- Webhook: POST /auth/verify/webhook — returns 200 on success, 401 on failure (generic error message, no field-specific info leak)
+- Webhook: POST /auth/verify/webhook — 200 + session_token on success, 401 on any failure (one generic message, TR/EN), 429 when locked, 403 without the platform secret
+- Dispatch tool (manual dashboard config, see docs/auth_flow.md): header `Authorization: Bearer <PLATFORM_WEBHOOK_SECRET>` (workspace secret / secret__ variable), body `conversation_id` ← {{system__conversation_id}}, `caller_number` ← {{system__caller_id}}, optional `language`; assignment response.session_token → {{session_token}}
 - Dynamic variables: first_name, application_ref, application_status injected into system prompt by ElevenLabs
 - Dynamic variables extracted from system prompt every turn for persistent auth state
 - Workflow configured via dashboard (tool node requires dashboard webhook config), deploy script preserves workflow
@@ -208,7 +222,7 @@ make test-live         # Live API + simulation tests
 - ✅ Document request with type detection — detects document type from conversation history
 - ✅ Clarifying questions for ambiguous requests
 - ✅ Multi-intent in single conversation — status check → appointment → document → complaint transitions
-- ✅ 293 tests (104 core system + auth + services + API security + edge cases + schemas + logging)
+- ✅ 370 tests (104 core system + auth webhook + session token + services + API security + identity hashing + edge cases + schemas + logging)
 - ✅ 31 manual voice e2e test scenarios documented
 
 ### Twilio Phone Integration (ISSUE-15B) — IN PROGRESS
@@ -246,9 +260,28 @@ make test-live         # Live API + simulation tests
 - tests/test_api_security.py — 60 tests (12 skip without OPENAI_API_KEY because importing agent.server / escalate builds ChatOpenAI)
 - Not done (optional, from spec): moving the gov API off the public app entirely
 
+### Keyed Identifier Hashes (ISSUE-45) — COMPLETE
+- Problem: plain SHA-256 of TC Kimlik (~900M valid values) is brute-forceable from a DB copy; webhook auth regenerated TCs from seed data, so only seeded citizens could authenticate
+- api/crypto.py: `keyed_hash()` = HMAC-SHA256 under ID_HASH_PEPPER, RuntimeError if pepper missing or < 32 chars; agent/server.py logs an error at startup if so
+- Citizen.tc_last4_hash (indexed, not unique) added; tc_kimlik_hash and all AuthAuditLog hashes (tc-kimlik + app-ref flows) now keyed
+- verify_webhook: SQL match on tc_last4_hash + DOB, father initial in Python (Unicode-safe upper), exactly one match required (>1 → 401 + warning); no api/seed_data imports
+- No migration: delete data/citizens.db and reseed (README + How to Run); seed_data detects the old schema and stops with that instruction
+- tests/test_identity_hashing.py — 44 tests (real seed() into a fresh DB, all 23 seed citizens authenticate; non-seed citizen; ambiguous match; source checks for hashlib)
+
+### Auth Endpoint Hardening (ISSUE-46) — COMPLETE
+- Every /auth route requires `Authorization: Bearer <PLATFORM_WEBHOOK_SECRET>` (`require_platform_secret` in api/security.py, compare_digest, fail closed)
+- `AttemptLimiter` in api/auth.py: 3 failures per conversation_id and per keyed hash of caller_number in a 15-min sliding window → 429; successes don't count; in-memory per process (production needs a shared store)
+- One generic failure message per language (`language` body field, tr default); specific reason only in the audit row
+- Audit row per attempt: session_id = conversation_id, method `webhook_last4_dob_father`, attempt_number, result, failure_reason `format`/`no_match`/`locked`, citizen_id_hash = keyed_hash(str(citizen.id)) on success. Factor values never logged or audited (the old log line printing last 4/DOB/initial is gone)
+- Success returns `session_token` (agent/session_token.py) next to the existing fields
+- Removed /auth/verify/tc-kimlik and /auth/verify/app-ref + their tests (not used by the voice flow)
+- No schema change (no DB reset needed beyond ISSUE-45)
+- Pending manual step: ElevenLabs dispatch tool header, body fields and session_token assignment (docs/auth_flow.md). Until done, the live webhook returns 403/422
+
 ### Technical Debt
+- docs/auth_flow.md data-handling table says DOB and last name are stored "Hashed"; they are stored in plaintext in the citizens table
 - POST /twilio/inbound (api/twilio_webhook.py) is unguarded and returns first name + citizen_id for a known phone number — needs ElevenLabs/Twilio webhook auth (secret header or signature), out of ISSUE-44 scope
-- Rate limit not enforced: slowapi Limiter(default_limits=["60/minute"]) is configured in agent/server.py, but there is no SlowAPIMiddleware and no @limiter.limit decorator, so no route is limited (verified: 80 rapid requests → 80× 200). /auth/verify/* also has no server-side lockout (attempt_number is client-supplied)
+- Rate limit not enforced: slowapi Limiter(default_limits=["60/minute"]) is configured in agent/server.py, but there is no SlowAPIMiddleware and no @limiter.limit decorator, so no route is limited (verified: 80 rapid requests → 80× 200). The auth webhook has its own attempt limit since ISSUE-46
 - Workflow backward edges don't trigger with Custom LLM — LangGraph handles topic changes via intent_classify as fallback
 - Service Router must use GPT-4o (not Custom LLM) for workflow edge transitions
 - Buffer words after auth ("kontrol ediyorum") — causes workflow edge issues, deferred

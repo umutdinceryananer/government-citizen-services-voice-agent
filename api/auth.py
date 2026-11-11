@@ -1,71 +1,145 @@
 """
-Authentication endpoint for caller identity verification.
+Caller identity verification for the ElevenLabs Workflow dispatch tool.
 
-POST /auth/verify — accepts credentials, validates format,
-checks against citizen database, and returns auth result
-with audit logging. No raw PII in logs or responses.
+POST /auth/verify/webhook — last 4 TC Kimlik digits + date of birth + father's
+name initial (STT-friendly, no 11-digit number over voice).
+
+Hardening:
+- Only the platform may call /auth: Authorization: Bearer PLATFORM_WEBHOOK_SECRET
+- Server-side attempt limit per conversation and per caller number
+- One generic failure message per language; the specific reason goes only
+  to the audit log
+- Every attempt is audited without factor values; success returns a signed
+  session token (agent/session_token.py)
+
+The former /auth/verify/tc-kimlik and /auth/verify/app-ref endpoints were
+removed — the voice flow never called them.
 """
 
-import hashlib
+import threading
+import time
+from collections import deque
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from agent import session_token
 from agent.logging_config import get_logger
-from agent.tools.tc_kimlik import validate_tc_kimlik, mask_tc_kimlik
-from agent.tools.app_ref import validate_app_ref
+from agent.tools.date_parser import normalize_date
+from api.crypto import keyed_hash
 from api.models import Application, AuthAuditLog, Citizen, get_db
+from api.security import require_platform_secret
 
 logger = get_logger(__name__)
 
-router = APIRouter(prefix="/auth", tags=["authentication"])
+router = APIRouter(
+    prefix="/auth",
+    tags=["authentication"],
+    dependencies=[Depends(require_platform_secret)],
+)
+
+AUDIT_METHOD = "webhook_last4_dob_father"
+
+FAILURE_MESSAGES = {
+    "tr": "Kimlik dogrulama basarisiz. Lutfen bilgilerinizi kontrol edip tekrar deneyin.",
+    "en": "Identity verification failed. Please check your details and try again.",
+}
+LOCKED_MESSAGES = {
+    "tr": "Cok fazla basarisiz deneme yapildi. Lutfen daha sonra tekrar deneyin veya bir operatore baglanmak isteyin.",
+    "en": "Too many failed attempts. Please try again later or ask to speak with an operator.",
+}
+WELCOME_MESSAGES = {
+    "tr": "Hosgeldiniz, {name}.",
+    "en": "Welcome, {name}.",
+}
+
+
+# --- Attempt limiting ---
+
+class AttemptLimiter:
+    """Counts failed auth attempts per key in a sliding time window.
+
+    Per process and in memory: fine for the single-process demo server, but
+    with several workers or instances each keeps its own counts, and a
+    restart clears them. Production needs a shared store (e.g. Redis keys
+    with a TTL) so the limit holds across processes.
+    """
+
+    MAX_TRACKED_KEYS = 10_000  # sweep expired keys beyond this to bound memory
+
+    def __init__(self, max_failures: int = 3, window_seconds: float = 15 * 60, clock=time.monotonic):
+        self.max_failures = max_failures
+        self.window_seconds = window_seconds
+        self._clock = clock
+        self._failures: dict[str, deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def _recent(self, key: str, now: float) -> deque[float]:
+        """Drop expired timestamps for `key` and return what is left. Caller holds the lock."""
+        stamps = self._failures.get(key)
+        if stamps is None:
+            return deque()
+        while stamps and stamps[0] <= now - self.window_seconds:
+            stamps.popleft()
+        if not stamps:
+            del self._failures[key]
+        return stamps
+
+    def failures(self, key: str) -> int:
+        with self._lock:
+            return len(self._recent(key, self._clock()))
+
+    def is_locked(self, *keys: str) -> bool:
+        with self._lock:
+            now = self._clock()
+            return any(len(self._recent(k, now)) >= self.max_failures for k in keys)
+
+    def record_failure(self, *keys: str) -> None:
+        with self._lock:
+            now = self._clock()
+            if len(self._failures) > self.MAX_TRACKED_KEYS:
+                for k in list(self._failures):
+                    self._recent(k, now)
+            for k in keys:
+                self._failures.setdefault(k, deque()).append(now)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._failures.clear()
+
+
+# 3 failures per conversation and per caller number within 15 minutes
+attempt_limiter = AttemptLimiter()
 
 
 # --- Request / Response models ---
 
-class AuthRequestTcKimlik(BaseModel):
-    """Primary auth method: TC Kimlik + Date of Birth."""
-    tc_kimlik: str
-    date_of_birth: str  # DD/MM/YYYY
-    session_id: str
-    attempt_number: int = 1
-
-
-class AuthRequestAppRef(BaseModel):
-    """Secondary auth method: Application Reference + Last Name."""
-    app_ref: str
-    last_name: str
-    session_id: str
-    attempt_number: int = 1
-
-
 class AuthWebhookRequest(BaseModel):
-    """Webhook-compatible auth request for ElevenLabs dispatch tool.
+    """Dispatch tool request.
 
-    Uses last 4 digits of TC Kimlik + date of birth + father's first
-    letter — STT-friendly (no 11-digit number over voice).
-    Parameters extracted by LLM from conversation.
+    The three factors are extracted by the LLM from the conversation;
+    conversation_id and caller_number come from ElevenLabs system variables.
     """
     tc_kimlik_last4: str
     date_of_birth: str
     father_initial: str
+    conversation_id: str = Field(min_length=1)  # {{system__conversation_id}}
+    caller_number: str | None = None             # {{system__caller_id}}, absent for web calls
+    language: str = "tr"                         # call language: "tr" or "en"
 
 
 class AuthResponse(BaseModel):
-    """Standardized auth response."""
+    """Success response. Failures are HTTP errors with a generic `detail` message."""
     is_error: bool
     message: str
     citizen_profile: dict | None = None
     guidance: str | None = None
+    session_token: str | None = None
 
 
 # --- Helpers ---
-
-def _hash(value: str) -> str:
-    return hashlib.sha256(value.encode()).hexdigest()
-
 
 def _citizen_to_safe_profile(citizen: Citizen, db: Session) -> dict:
     """Convert citizen record to a safe profile (no raw PII).
@@ -74,7 +148,6 @@ def _citizen_to_safe_profile(citizen: Citizen, db: Session) -> dict:
     Returns the most recent application for backward compatibility with
     ElevenLabs dynamic variables ({{application_ref}}, {{application_status}}).
     """
-    # Get the most recent application (for backward compat with dashboard)
     latest_app = (
         db.query(Application)
         .filter(Application.citizen_id == citizen.id)
@@ -99,230 +172,95 @@ def _citizen_to_safe_profile(citizen: Citizen, db: Session) -> dict:
 
 def _log_audit(
     db: Session,
-    session_id: str,
-    method: str,
+    conversation_id: str,
     attempt_number: int,
     result: str,
     citizen_id_hash: str | None = None,
     failure_reason: str | None = None,
-):
-    """Write an audit record. No raw PII."""
-    audit = AuthAuditLog(
+) -> None:
+    """Write an audit record. Never stores the factors (last 4, DOB, father initial)."""
+    db.add(AuthAuditLog(
         timestamp=datetime.now(UTC),
-        session_id=session_id,
-        method=method,
+        session_id=conversation_id,
+        method=AUDIT_METHOD,
         attempt_number=attempt_number,
         result=result,
         citizen_id_hash=citizen_id_hash,
         failure_reason=failure_reason,
-    )
-    db.add(audit)
+    ))
     db.commit()
 
 
-def _failure_guidance(attempt: int) -> str:
-    """Progressive guidance based on attempt number."""
-    if attempt == 1:
-        return "Girdiginiz bilgiler eslesmedi. Lutfen tekrar deneyin."
-    elif attempt == 2:
-        return "Bilgiler yine eslesmedi. Son bir deneme hakkiniz var. Dilerseniz basvuru numaraniz ile de dogrulama yapabiliriz."
-    else:
-        return "Kimliginizi dogrulayamadim. Guvenliginiz icin sizi bir musait operatore bagliyorum."
+def _limiter_keys(request: AuthWebhookRequest) -> list[str]:
+    """Limit per conversation, and per caller number when the platform sends one."""
+    keys = [f"conversation:{request.conversation_id}"]
+    caller = (request.caller_number or "").strip()
+    if caller:
+        keys.append(f"caller:{keyed_hash(caller)}")
+    return keys
 
 
-# --- Endpoints ---
+def _match_citizen(request: AuthWebhookRequest, db: Session) -> tuple[Citizen | None, str | None]:
+    """Return (citizen, None) on a unique match, else (None, "format" | "no_match")."""
+    last4 = "".join(c for c in request.tc_kimlik_last4 if c.isdigit())
+    normalized_dob, date_error = normalize_date(request.date_of_birth)
+    father_initial = request.father_initial.strip().upper()[:1]
+    if len(last4) != 4 or date_error or not father_initial.isalpha():
+        return None, "format"
 
-@router.post("/verify/tc-kimlik", response_model=AuthResponse)
-def verify_tc_kimlik(
-    request: AuthRequestTcKimlik,
-    db: Session = Depends(get_db),
-):
-    """Verify caller identity using TC Kimlik + Date of Birth."""
-    logger.info(f"Auth attempt (tc_kimlik) | session={request.session_id} | attempt={request.attempt_number}")
+    # Match keyed hash of last 4 digits + DOB in SQL (indexed), then father
+    # initial in Python — str.upper() is Unicode-aware, SQLite's upper() is not.
+    candidates = db.query(Citizen).filter(
+        Citizen.tc_last4_hash == keyed_hash(last4),
+        Citizen.date_of_birth == normalized_dob,
+    ).all()
+    matches = [c for c in candidates if c.father_name and c.father_name[0].upper() == father_initial]
 
-    # Step 1: Validate TC Kimlik format + checksum
-    is_valid, error = validate_tc_kimlik(request.tc_kimlik)
-    if not is_valid:
-        _log_audit(db, request.session_id, "tc_kimlik_dob", request.attempt_number,
-                   "failure", failure_reason=f"format_invalid: {error}")
-        return AuthResponse(
-            is_error=True,
-            message=error,
-            guidance=_failure_guidance(request.attempt_number),
-        )
+    # Exactly one citizen must match. Two citizens sharing last 4 + DOB +
+    # father initial cannot be told apart, so refuse rather than guess.
+    if len(matches) > 1:
+        logger.warning(f"Auth webhook ambiguous match | candidates={len(matches)}")
+    if len(matches) != 1:
+        return None, "no_match"
+    return matches[0], None
 
-    # Step 2: Look up citizen by TC Kimlik hash
-    tc_hash = _hash(request.tc_kimlik.replace(" ", "").replace("-", ""))
-    citizen = db.query(Citizen).filter(Citizen.tc_kimlik_hash == tc_hash).first()
 
-    if not citizen:
-        _log_audit(db, request.session_id, "tc_kimlik_dob", request.attempt_number,
-                   "failure", failure_reason="tc_kimlik_not_found")
-        return AuthResponse(
-            is_error=True,
-            message="TC Kimlik numarasi sistemde bulunamadi.",
-            guidance=_failure_guidance(request.attempt_number),
-        )
-
-    # Step 3: Verify date of birth
-    dob_cleaned = request.date_of_birth.strip()
-    if dob_cleaned != citizen.date_of_birth:
-        _log_audit(db, request.session_id, "tc_kimlik_dob", request.attempt_number,
-                   "failure", citizen_id_hash=tc_hash, failure_reason="dob_mismatch")
-        return AuthResponse(
-            is_error=True,
-            message="Dogum tarihi eslesmedi.",
-            guidance=_failure_guidance(request.attempt_number),
-        )
-
-    # Success
-    _log_audit(db, request.session_id, "tc_kimlik_dob", request.attempt_number,
-               "success", citizen_id_hash=tc_hash)
-    logger.info(f"Auth success | session={request.session_id} | citizen_hash={tc_hash[:12]}...")
-
-    return AuthResponse(
-        is_error=False,
-        message=f"Hosgeldiniz, {citizen.first_name}.",
-        citizen_profile=_citizen_to_safe_profile(citizen, db),
-    )
-
+# --- Endpoint ---
 
 @router.post("/verify/webhook", response_model=AuthResponse)
 def verify_webhook(
     request: AuthWebhookRequest,
     db: Session = Depends(get_db),
 ):
-    """Webhook-compatible auth for ElevenLabs Workflow dispatch tool.
+    """Webhook-compatible auth for the ElevenLabs Workflow dispatch tool.
 
-    Uses last 4 digits of TC Kimlik + date of birth + father's name
-    first letter. STT-friendly — no 11-digit number over voice.
-
-    Returns is_error=false on success (dispatch tool routes to
-    authenticated subagent), is_error=true on failure (routes to
-    retry or human transfer).
+    200 + session_token on success (dispatch tool routes to the authenticated
+    subagent); 401 with one generic message on any failure; 429 once the
+    attempt limit is reached. Factor values are never logged or audited.
     """
-    logger.info(f"Auth webhook attempt | last4={request.tc_kimlik_last4} | dob={request.date_of_birth} | father={request.father_initial}")
+    language = "en" if request.language.strip().lower().startswith("en") else "tr"
+    keys = _limiter_keys(request)
+    attempt = attempt_limiter.failures(keys[0]) + 1  # attempt number within this conversation
+    logger.info(f"Auth webhook attempt | conversation={request.conversation_id} | attempt={attempt}")
 
-    # Validate last 4 digits
-    last4 = "".join(c for c in request.tc_kimlik_last4 if c.isdigit())
-    if len(last4) != 4:
-        raise HTTPException(status_code=401, detail="Kimlik dogrulama basarisiz. Lutfen bilgilerinizi kontrol edip tekrar deneyin.")
+    if attempt_limiter.is_locked(*keys):
+        _log_audit(db, request.conversation_id, attempt, "failure", failure_reason="locked")
+        logger.warning(f"Auth webhook locked | conversation={request.conversation_id}")
+        raise HTTPException(status_code=429, detail=LOCKED_MESSAGES[language])
 
-    # Normalize date format
-    from agent.tools.date_parser import normalize_date
-    normalized_dob, date_error = normalize_date(request.date_of_birth)
+    citizen, reason = _match_citizen(request, db)
+    if citizen is None:
+        attempt_limiter.record_failure(*keys)
+        _log_audit(db, request.conversation_id, attempt, "failure", failure_reason=reason)
+        raise HTTPException(status_code=401, detail=FAILURE_MESSAGES[language])
 
-    if date_error:
-        raise HTTPException(status_code=401, detail="Kimlik dogrulama basarisiz. Lutfen bilgilerinizi kontrol edip tekrar deneyin.")
-
-    # Normalize father initial
-    father_initial = request.father_initial.strip().upper()[:1]
-    if not father_initial.isalpha():
-        raise HTTPException(status_code=401, detail="Kimlik dogrulama basarisiz. Lutfen bilgilerinizi kontrol edip tekrar deneyin.")
-
-    # Search DB — match last 4 digits of TC hash + DOB + father initial
-    # Since we store hashed TC, we check all citizens matching DOB + father initial
-    # then verify last 4 digits against the full TC Kimlik
-    candidates = db.query(Citizen).filter(
-        Citizen.date_of_birth == normalized_dob,
-    ).all()
-
-    # Filter by father initial
-    candidates = [c for c in candidates if c.father_name and c.father_name[0].upper() == father_initial]
-
-    if not candidates:
-        raise HTTPException(status_code=401, detail="Kimlik dogrulama basarisiz. Lutfen bilgilerinizi kontrol edip tekrar deneyin.")
-
-    # Check last 4 digits against stored TC hashes
-    # We need to reverse-check: generate TC from seed and compare last 4
-    # In production this would use a last4_digits column — for demo we check all candidates
-    from api.seed_data import generate_valid_tc, SEED_CITIZENS
-    matched_citizen = None
-    for citizen in candidates:
-        # Find the seed data for this citizen to get full TC
-        for seed_row in SEED_CITIZENS:
-            tc_full = generate_valid_tc(seed_row[0])
-            if _hash(tc_full) == citizen.tc_kimlik_hash:
-                if tc_full[-4:] == last4:
-                    matched_citizen = citizen
-                    break
-        if matched_citizen:
-            break
-
-    if not matched_citizen:
-        raise HTTPException(status_code=401, detail="Kimlik dogrulama basarisiz. Lutfen bilgilerinizi kontrol edip tekrar deneyin.")
-
-    # Success
-    logger.info(f"Auth webhook success | citizen_id={matched_citizen.id}")
+    token = session_token.issue(citizen.id, request.conversation_id)
+    _log_audit(db, request.conversation_id, attempt, "success", citizen_id_hash=keyed_hash(str(citizen.id)))
+    logger.info(f"Auth webhook success | conversation={request.conversation_id} | citizen_id={citizen.id}")
 
     return AuthResponse(
         is_error=False,
-        message=f"Hosgeldiniz, {matched_citizen.first_name}.",
-        citizen_profile=_citizen_to_safe_profile(matched_citizen, db),
-    )
-
-
-@router.post("/verify/app-ref", response_model=AuthResponse)
-def verify_app_ref(
-    request: AuthRequestAppRef,
-    db: Session = Depends(get_db),
-):
-    """Verify caller identity using Application Reference + Last Name."""
-    logger.info(f"Auth attempt (app_ref) | session={request.session_id} | attempt={request.attempt_number}")
-
-    # Step 1: Validate app ref format
-    is_valid, error = validate_app_ref(request.app_ref)
-    if not is_valid:
-        _log_audit(db, request.session_id, "app_ref_lastname", request.attempt_number,
-                   "failure", failure_reason=f"format_invalid: {error}")
-        return AuthResponse(
-            is_error=True,
-            message=error,
-            guidance=_failure_guidance(request.attempt_number),
-        )
-
-    # Step 2: Look up application by reference, then find citizen
-    app_ref_cleaned = request.app_ref.strip().upper()
-    application = db.query(Application).filter(Application.application_ref == app_ref_cleaned).first()
-
-    if not application:
-        _log_audit(db, request.session_id, "app_ref_lastname", request.attempt_number,
-                   "failure", failure_reason="app_ref_not_found")
-        return AuthResponse(
-            is_error=True,
-            message="Basvuru numarasi sistemde bulunamadi.",
-            guidance=_failure_guidance(request.attempt_number),
-        )
-
-    citizen = db.query(Citizen).filter(Citizen.id == application.citizen_id).first()
-
-    if not citizen:
-        _log_audit(db, request.session_id, "app_ref_lastname", request.attempt_number,
-                   "failure", failure_reason="citizen_not_found")
-        return AuthResponse(
-            is_error=True,
-            message="Basvuru numarasi sistemde bulunamadi.",
-            guidance=_failure_guidance(request.attempt_number),
-        )
-
-    # Step 3: Verify last name (case-insensitive)
-    if request.last_name.strip().lower() != citizen.last_name.lower():
-        _log_audit(db, request.session_id, "app_ref_lastname", request.attempt_number,
-                   "failure", citizen_id_hash=_hash(application.application_ref),
-                   failure_reason="lastname_mismatch")
-        return AuthResponse(
-            is_error=True,
-            message="Soyad eslesmedi.",
-            guidance=_failure_guidance(request.attempt_number),
-        )
-
-    # Success
-    _log_audit(db, request.session_id, "app_ref_lastname", request.attempt_number,
-               "success", citizen_id_hash=_hash(application.application_ref))
-    logger.info(f"Auth success (app_ref) | session={request.session_id}")
-
-    return AuthResponse(
-        is_error=False,
-        message=f"Hosgeldiniz, {citizen.first_name}.",
+        message=WELCOME_MESSAGES[language].format(name=citizen.first_name),
         citizen_profile=_citizen_to_safe_profile(citizen, db),
+        session_token=token,
     )

@@ -83,7 +83,32 @@ Reference: [Designing Secure Caller Identity Authentication Flows for Voice Agen
 3. **Subagent 2 only reachable via success edge** — No prompt injection can bypass this gate.
 4. **Retry counter tracked via dynamic variable** — `auth_attempt_count` incremented on each failure, expression edge checks `auth_attempt_count >= 3`.
 
-## Authentication Methods
+## Verification Webhook (Implemented)
+
+`POST /auth/verify/webhook` is the only auth endpoint. The dispatch tool sends the last 4 TC Kimlik digits, date of birth and father's name initial. The server:
+
+- **Answers only the platform** — requires `Authorization: Bearer <PLATFORM_WEBHOOK_SECRET>` on every `/auth` route (403 otherwise)
+- **Limits attempts server-side** — 3 failures per `conversation_id` and per keyed hash of `caller_number` within 15 minutes, then 429. In-memory and per process (demo); production needs a shared store such as Redis
+- **Reveals nothing** — one generic failure message (TR/EN) whether the ID is unknown, the date is wrong or the initial is wrong
+- **Audits every attempt** — `auth_audit_log` row with conversation id, attempt number, outcome and category (`format`, `no_match`, `locked`), plus the keyed hash of the citizen id on success. Never the factors
+- **Returns a signed session token** — `session_token` (agent/session_token.py, HMAC-SHA256, bound to the conversation, 1 hour) next to `citizen_profile`
+
+| Status | Meaning |
+|--------|---------|
+| 200 | Verified — `is_error: false`, `citizen_profile`, `session_token` |
+| 401 | Any verification failure — one generic message |
+| 429 | Attempt limit reached for this conversation or caller number |
+| 403 | Missing or wrong platform secret |
+
+### ElevenLabs Dispatch Tool Configuration (manual, in the dashboard)
+
+1. **Header:** `Authorization: Bearer <PLATFORM_WEBHOOK_SECRET>`. Store the value as a workspace secret, or as a dynamic variable with the `secret__` prefix — whichever the tool editor offers for headers. Secret variables are used in headers only and are never sent to the LLM.
+2. **Body fields:** `conversation_id` from `{{system__conversation_id}}`, `caller_number` from `{{system__caller_id}}`. Optional: `language` (`tr` / `en`, LLM-filled from the conversation; defaults to `tr`) so failure messages match the call language.
+3. **Assignment:** `response.session_token` → dynamic variable `session_token`.
+
+## Authentication Methods (original design)
+
+> The tc-kimlik (Method A) and app-ref (Method B) endpoints were removed: the voice flow uses the webhook above (last 4 digits + DOB + father initial) and never called them. The design notes below are kept for reference.
 
 ### Method A: TC Kimlik + Date of Birth (Primary)
 
@@ -146,7 +171,7 @@ English:
 
 | Data | Logged | Stored | Retention |
 |------|:------:|:------:|-----------|
-| TC Kimlik | Masked (123****901) | Hashed (SHA-256) | 30 days |
+| TC Kimlik | Masked (123****901) | Keyed hash (HMAC-SHA256, ID_HASH_PEPPER) | 30 days |
 | Date of Birth | Masked (**/**/1990) | Hashed | 30 days |
 | Application Ref | Masked (2024-TR-****) | Plain | 30 days |
 | Last Name | First letter only (Y***) | Hashed | 30 days |
@@ -165,7 +190,7 @@ Every auth attempt generates an audit record:
   "method": "tc_kimlik_dob",
   "attempt_number": 1,
   "result": "success",
-  "citizen_id_hash": "sha256:a1b2c3...",
+  "citizen_id_hash": "hmac-sha256:a1b2c3...",
   "ip_or_caller_id": "redacted"
 }
 ```

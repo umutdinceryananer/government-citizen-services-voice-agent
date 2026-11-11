@@ -6,8 +6,10 @@ endpoint (agent/server.py, exposed through ngrok). These dependencies make sure
 only our own LangGraph nodes (internal key) and operators (admin key) can reach
 routes that read or change citizen data.
 
-- require_internal_key: X-Internal-Key header must match INTERNAL_API_KEY
-- require_admin_key:    X-Admin-Key header must match ADMIN_API_KEY
+- require_internal_key:    X-Internal-Key header must match INTERNAL_API_KEY
+- require_admin_key:       X-Admin-Key header must match ADMIN_API_KEY
+- require_platform_secret: Authorization: Bearer <PLATFORM_WEBHOOK_SECRET>
+                           (the ElevenLabs dispatch tool — every /auth route)
 
 Keys are read from the environment on every request. If a key is not
 configured, every request to the routes it guards is refused (fail closed).
@@ -54,3 +56,16 @@ def require_admin_key(
 ) -> None:
     """Allow only callers holding ADMIN_API_KEY (operators, never the voice flow)."""
     _verify_key(x_admin_key, "ADMIN_API_KEY", request)
+
+
+def require_platform_secret(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> None:
+    """Allow only the ElevenLabs platform: Authorization: Bearer <PLATFORM_WEBHOOK_SECRET>."""
+    token = None
+    if authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer":
+            token = value.strip()
+    _verify_key(token, "PLATFORM_WEBHOOK_SECRET", request)
