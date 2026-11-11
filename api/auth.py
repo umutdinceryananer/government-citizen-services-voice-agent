@@ -254,7 +254,7 @@ def verify_webhook(
         _log_audit(db, request.conversation_id, attempt, "failure", failure_reason=reason)
         raise HTTPException(status_code=401, detail=FAILURE_MESSAGES[language])
 
-    token = session_token.issue(citizen.id, request.conversation_id)
+    token = session_token.issue(citizen.id)
     _log_audit(db, request.conversation_id, attempt, "success", citizen_id_hash=keyed_hash(str(citizen.id)))
     logger.info(f"Auth webhook success | conversation={request.conversation_id} | citizen_id={citizen.id}")
 

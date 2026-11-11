@@ -33,6 +33,10 @@ TEST_SESSION_TOKEN_SECRET = "test-session-secret-0123456789abcdef0123"
 os.environ["PLATFORM_WEBHOOK_SECRET"] = TEST_PLATFORM_SECRET
 os.environ["SESSION_TOKEN_SECRET"] = TEST_SESSION_TOKEN_SECRET
 PLATFORM_AUTH = {"Authorization": f"Bearer {TEST_PLATFORM_SECRET}"}
+# Custom LLM endpoint secret (agent/server.py)
+TEST_CUSTOM_LLM_SECRET = "test-custom-llm-secret"
+os.environ["CUSTOM_LLM_SECRET"] = TEST_CUSTOM_LLM_SECRET
+CUSTOM_LLM_AUTH = {"Authorization": f"Bearer {TEST_CUSTOM_LLM_SECRET}"}
 
 # Single in-memory DB shared across all test modules
 test_engine = create_engine(

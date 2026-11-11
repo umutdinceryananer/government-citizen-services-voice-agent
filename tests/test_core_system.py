@@ -1168,7 +1168,8 @@ class TestSSEProxy:
     def setup(self):
         from fastapi.testclient import TestClient
         from agent.server import app
-        self.client = TestClient(app)
+        from tests.conftest import CUSTOM_LLM_AUTH
+        self.client = TestClient(app, headers=CUSTOM_LLM_AUTH)  # acts as ElevenLabs
         import agent.server as srv
         srv._cb_failures = 0
         srv._cb_opened_at = None
@@ -1199,16 +1200,20 @@ class TestSSEProxy:
         assert first_data["choices"][0]["delta"]["role"] == "assistant"
 
     @pytest.mark.skipif(not os.getenv("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
-    def test_sse_with_authenticated_context(self):
-        """SSE stream works with authenticated citizen profile."""
+    def test_sse_with_authenticated_context(self, monkeypatch):
+        """SSE stream works for a caller authenticated by a session token."""
+        import api.models
+        from agent import session_token
+        from tests.conftest import TestSession
+        monkeypatch.setattr(api.models, "SessionLocal", TestSession)  # profile comes from the test DB
+
         r = self.client.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "Check my application status"}],
+            "messages": [
+                {"role": "system", "content": f"[NODE:status_check]\nSESSION_TOKEN={session_token.issue(1)}"},
+                {"role": "user", "content": "Check my application status"},
+            ],
             "stream": True,
-            "elevenlabs_extra_body": {
-                "conversation_id": "test-sse-auth",
-                "auth_status": "authenticated",
-                "citizen_profile": PROFILE_SINGLE_APP,
-            },
+            "elevenlabs_extra_body": {"conversation_id": "test-sse-auth"},
         })
         assert r.status_code == 200
         content_parts = []

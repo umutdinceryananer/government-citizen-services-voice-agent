@@ -1761,3 +1761,36 @@ POST /auth/verify/webhook accepted calls from anyone, had no server-side attempt
 - [x] One audit row per attempt; no row contains a factor value
 - [x] A success response contains a session_token that agent.session_token.verify accepts
 - [x] Full test suite passes (no new failures; tests/test_auth.py 35 + tests/test_session_token.py 18)
+
+---
+
+# ISSUE-47: Authenticate the Custom LLM Endpoint and Stop Trusting Prompt Text
+
+## Module
+Security
+
+## Priority
+P0 (high severity)
+
+## Dependencies
+ISSUE-46
+
+## Description
+POST /v1/chat/completions and POST /chat/completions accepted requests from anyone who knew the ngrok URL. chat_completions set auth_status to authenticated when the system prompt matched `Vatandasin adi:` and took citizen_id from `Vatandas ID:` — a crafted system message got the applications, appointments and documents of any citizen id and could book or cancel in that citizen's name. The same trust also came from `elevenlabs_extra_body` (auth_status / citizen_profile).
+
+## Tasks
+- [x] Require `Authorization: Bearer <CUSTOM_LLM_SECRET>` on both routes, 401 when missing or wrong
+- [ ] Confirm the header ElevenLabs sends for the custom LLM API key on a live call (rejections log header names only; no live call possible here — credits exhausted)
+- [x] agent/session_token.py: `issue(subject_id, ttl_seconds=900)`, `verify(token)` → citizen id | None; format `<citizen_id>.<expires_unix>.<hex HMAC-SHA256>` under SESSION_TOKEN_SECRET
+- [x] Removed the `Vatandasin adi` / `Vatandas ID` / `Basvuru numarasi` / `Basvuru durumu` regexes and the extra-body auth path; only a valid `SESSION_TOKEN=<token>` in the system prompt authenticates; first name, gender and applications loaded from the DB
+- [x] Token redacted from the messages passed to the graph
+- [x] `[NODE:xxx]` parsing kept for routing/logging context
+- [x] CUSTOM_LLM_SECRET= added to .env.example; startup warning when unset
+- [ ] Manual (ElevenLabs): custom LLM API key = workspace secret with CUSTOM_LLM_SECRET; `SESSION_TOKEN={{session_token}}` in every post-auth custom LLM node prompt (normal variable, not in native-LLM nodes)
+
+## Acceptance Criteria
+- [x] Missing or wrong bearer token returns 401
+- [x] `Vatandasin adi: X` + `Vatandas ID: 1` without a valid token leaves the caller unauthenticated and fetches no citizen data
+- [x] A valid token authenticates; an expired token or one changed character does not
+- [x] tests/test_core_system.py and tests/test_agent_connection.py pass with the header and a token
+- [x] Full test suite passes (no new failures; tests/test_custom_llm_auth.py 26 tests)

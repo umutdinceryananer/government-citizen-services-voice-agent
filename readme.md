@@ -82,7 +82,7 @@ Citizens must verify their identity before accessing personal information. The s
 
 The authentication flow follows ElevenLabs' Workflow best practices for secure caller identity verification: a deterministic dispatch tool (webhook) routes to authenticated or retry subagent based on boolean result, no LLM inference involved in the auth decision. KVKK (Turkish GDPR) compliant: PII redaction in all logs, TC Kimlik stored only as a keyed HMAC-SHA256 hash (secret pepper kept outside the database, so a stolen copy cannot be brute-forced), audit trail with no raw PII.
 
-The verification webhook answers only the ElevenLabs platform (shared bearer secret), limits failed attempts on the server (3 per conversation and per caller number in 15 minutes), returns one generic failure message so a caller cannot tell which factor was wrong, audits every attempt without storing the factors, and returns a signed session token that the backend can verify later.
+The verification webhook answers only the ElevenLabs platform (shared bearer secret), limits failed attempts on the server (3 per conversation and per caller number in 15 minutes), returns one generic failure message so a caller cannot tell which factor was wrong, audits every attempt without storing the factors, and returns a signed session token. The Custom LLM endpoint accepts only ElevenLabs (bearer secret) and takes the caller's identity solely from that token, never from names or IDs in the prompt; the citizen profile is loaded from the database.
 
 ### 4. Graceful Degradation
 
@@ -277,7 +277,7 @@ This project demonstrates the following technical and design patterns:
 2. **Deterministic workflow design**: auth gating via dispatch tool plus subagent isolation (no LLM in the auth decision path), LLM condition edges for service routing, backward edges for auth retry. Demonstrates how to combine deterministic guarantees with LLM flexibility.
 3. **Enterprise public sector use case**: voice AI applied to a massive, underserved market with real compliance and security requirements.
 4. **Security-first design**: caller authentication as a core architectural concern. KVKK compliance, PII redaction, keyed HMAC-SHA256 hashed identifiers, audit trails.
-5. **Full-stack ownership**: voice layer, agent logic, API integrations, knowledge base, analytics dashboard, and 370-test suite, all built end-to-end.
+5. **Full-stack ownership**: voice layer, agent logic, API integrations, knowledge base, analytics dashboard, and 399-test suite, all built end-to-end.
 6. **Multilingual capability**: English plus Turkish with auto-detection and dynamic voice switching. Architecture extensible to additional languages.
 7. **Production resilience**: graceful degradation across three levels with circuit breaker pattern and health monitoring.
 8. **Measurable analytics**: 9-page dashboard with Sankey flow visualization, node-level timing, tool chain analysis, and knowledge gap detection.
@@ -340,7 +340,7 @@ python -m agent.deploy --dry-run  # Preview config without deploying
 # Run analytics dashboard
 python -m streamlit run dashboard/app.py
 
-# Run tests (370 tests)
+# Run tests (399 tests)
 python -m pytest tests/ -v
 ```
 
@@ -353,8 +353,8 @@ Government-Citizen-Services-Voice-Agent/
 │   ├── deploy.py                      # Deploy agent to ElevenLabs (EN primary + TR preset)
 │   ├── graph.py                       # LangGraph StateGraph definition (11 nodes)
 │   ├── logging_config.py              # PII redaction logging (KVKK compliance)
-│   ├── server.py                      # Custom LLM proxy, SSE streaming, circuit breaker, analytics logging
-│   ├── session_token.py               # Signed session tokens (HMAC) issued on successful auth
+│   ├── server.py                      # Custom LLM proxy (bearer secret, session-token identity), SSE streaming, circuit breaker, analytics logging
+│   ├── session_token.py               # Signed session tokens (<citizen_id>.<expiry>.<HMAC>, 15 min) issued on successful auth
 │   ├── state.py                       # AgentState TypedDict (incl. node detail tracking)
 │   ├── nodes/                         # Graph node implementations
 │   │   ├── intent_classify.py         # LLM-based intent classification (10 intents, GPT-4o)
@@ -403,11 +403,12 @@ Government-Citizen-Services-Voice-Agent/
 │   ├── auth_flow.md                   # Authentication state diagram
 │   ├── conversation_flow.md           # Conversation flow documentation
 │   └── langgraph_value.md             # LangGraph capabilities and voice test scenarios
-├── tests/                             # 370 tests
+├── tests/                             # 399 tests
 │   ├── conftest.py                    # Shared test DB setup, per-test audit log cleanup
 │   ├── test_core_system.py            # Comprehensive core system tests (104 tests, all product endings)
 │   ├── test_auth.py                   # Auth webhook: platform secret, attempt limit, generic failures, audit, token
-│   ├── test_session_token.py          # Session token signing, expiry, tampering, conversation binding
+│   ├── test_session_token.py          # Session token format, expiry, single-character tampering, wrong secret
+│   ├── test_custom_llm_auth.py        # Custom LLM endpoint: bearer secret, token-only identity, no prompt trust
 │   ├── test_services.py               # Government API endpoint tests
 │   ├── test_edge_cases.py             # TC Kimlik normalization, date parsing edge cases
 │   ├── test_handoff.py                # Escalation and handoff tests

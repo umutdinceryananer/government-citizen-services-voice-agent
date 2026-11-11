@@ -2,30 +2,29 @@
 Signed session tokens for authenticated calls.
 
 verify_webhook (api/auth.py) issues a token when a caller passes identity
-verification. ElevenLabs stores it in the {{session_token}} dynamic variable,
-and the Custom LLM server verifies it instead of trusting names and IDs that
-appear in the prompt.
+verification. ElevenLabs stores it in the {{session_token}} dynamic variable;
+custom LLM node prompts carry it as a `SESSION_TOKEN=<token>` line, and the
+Custom LLM server (agent/server.py) verifies it instead of trusting names and
+IDs that appear in the prompt.
 
-Format:  v1.<payload>.<signature>
-  payload   = base64url(JSON {"citizen_id", "conversation_id", "iat", "exp"})
-  signature = base64url(HMAC-SHA256(SESSION_TOKEN_SECRET, "v1." + payload))
+Format:  <citizen_id>.<expires_unix>.<hex HMAC-SHA256>
+  The HMAC covers "<citizen_id>.<expires_unix>" under SESSION_TOKEN_SECRET.
 
-The payload is signed, not encrypted. It holds only the internal citizen id
-and the conversation id — no personal data. Binding the token to the
-conversation id stops a token from one call being replayed in another.
+The token holds only the internal citizen id and an expiry — no personal
+data. It is signed, not encrypted, and is not bound to a conversation, so it
+stays valid for its TTL wherever it is presented.
 """
 
-import base64
-import binascii
 import hashlib
 import hmac
-import json
 import os
+import re
 import time
 
-VERSION = "v1"
 MIN_SECRET_LENGTH = 32
-DEFAULT_TTL_SECONDS = 60 * 60  # longer than any call
+DEFAULT_TTL_SECONDS = 900  # 15 minutes
+
+_TOKEN_RE = re.compile(r"(\d{1,18})\.(\d{1,12})\.([0-9a-f]{64})", re.ASCII)
 
 
 def _secret() -> bytes:
@@ -38,72 +37,39 @@ def _secret() -> bytes:
     return secret.encode("utf-8")
 
 
-def _b64encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+def _signature(body: str) -> str:
+    return hmac.new(_secret(), body.encode("ascii"), hashlib.sha256).hexdigest()
 
 
-def _b64decode(text: str) -> bytes:
-    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
-
-
-def _sign(signing_input: str) -> str:
-    return _b64encode(hmac.new(_secret(), signing_input.encode("ascii"), hashlib.sha256).digest())
-
-
-def issue(
-    citizen_id: int,
-    conversation_id: str,
-    ttl_seconds: int = DEFAULT_TTL_SECONDS,
-    now: float | None = None,
-) -> str:
-    """Return a signed token for `citizen_id`, bound to `conversation_id`.
+def issue(subject_id: int, ttl_seconds: int = DEFAULT_TTL_SECONDS, now: float | None = None) -> str:
+    """Return a signed token for `subject_id` (citizen id), valid for `ttl_seconds`.
 
     Raises RuntimeError if SESSION_TOKEN_SECRET is missing or too short.
     """
-    issued_at = int(time.time() if now is None else now)
-    claims = {
-        "citizen_id": citizen_id,
-        "conversation_id": conversation_id,
-        "iat": issued_at,
-        "exp": issued_at + ttl_seconds,
-    }
-    payload = _b64encode(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode("utf-8"))
-    signing_input = f"{VERSION}.{payload}"
-    return f"{signing_input}.{_sign(signing_input)}"
+    expires = int(time.time() if now is None else now) + ttl_seconds
+    body = f"{int(subject_id)}.{expires}"
+    return f"{body}.{_signature(body)}"
 
 
-def verify(token: str, conversation_id: str | None = None, now: float | None = None) -> dict | None:
-    """Return the token's claims if it is genuine and unexpired, else None.
+def verify(token: str, now: float | None = None) -> int | None:
+    """Return the citizen id for a genuine, unexpired token, else None.
 
-    When `conversation_id` is given, the token must also have been issued for
-    that conversation. Raises RuntimeError if SESSION_TOKEN_SECRET is missing
-    or too short — a misconfiguration should be loud, not look like a bad token.
+    Raises RuntimeError if SESSION_TOKEN_SECRET is missing or too short — a
+    misconfiguration should be loud, not look like a bad token.
     """
     _secret()  # fail loudly on misconfiguration before inspecting the token
 
     if not isinstance(token, str):
         return None
-    parts = token.split(".")
-    if len(parts) != 3 or parts[0] != VERSION:
+    match = _TOKEN_RE.fullmatch(token.strip())
+    if not match:
         return None
+    subject, expires, signature = match.groups()
 
-    try:
-        expected = _sign(f"{parts[0]}.{parts[1]}")
-    except UnicodeEncodeError:  # non-ASCII payload cannot be ours
+    expected = _signature(f"{subject}.{expires}")
+    if not hmac.compare_digest(expected, signature):
         return None
-    if not hmac.compare_digest(expected.encode("ascii"), parts[2].encode("utf-8")):
-        return None
-
-    try:
-        claims = json.loads(_b64decode(parts[1]))
-    except (ValueError, binascii.Error):
-        return None
-    if not isinstance(claims, dict) or not isinstance(claims.get("exp"), int):
-        return None
-
     current = time.time() if now is None else now
-    if claims["exp"] <= current:
+    if int(expires) <= current:
         return None
-    if conversation_id is not None and claims.get("conversation_id") != conversation_id:
-        return None
-    return claims
+    return int(subject)

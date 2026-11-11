@@ -262,13 +262,7 @@ class TestSessionTokenIssued:
     def test_success_returns_verifiable_token(self):
         r = _post(AHMET, "conv-token")
         token = r.json()["session_token"]
-        claims = session_token.verify(token, conversation_id="conv-token")
-        assert claims is not None
-        assert claims["citizen_id"] == r.json()["citizen_profile"]["citizen_id"] == _ahmet_id()
-
-    def test_token_is_bound_to_its_conversation(self):
-        token = _post(AHMET, "conv-token-a").json()["session_token"]
-        assert session_token.verify(token, conversation_id="conv-token-b") is None
+        assert session_token.verify(token) == r.json()["citizen_profile"]["citizen_id"] == _ahmet_id()
 
     def test_failure_returns_no_token(self):
         assert "session_token" not in _post(WRONG_DOB, "conv-token-fail").json()
@@ -287,10 +281,13 @@ class TestPIISafety:
         assert TC_AHMET not in text
         assert "15/03/1990" not in text
 
-    def test_token_claims_hold_no_personal_data(self):
+    def test_token_holds_no_personal_data(self):
         token = _post(AHMET, "conv-pii-token").json()["session_token"]
-        claims = session_token.verify(token)
-        assert set(claims) == {"citizen_id", "conversation_id", "iat", "exp"}
+        citizen_id, expires, signature = token.split(".")
+        assert citizen_id == str(_ahmet_id())
+        assert expires.isdigit() and len(signature) == 64
+        for value in ("Ahmet", "Yilmaz", "15/03/1990", TC_AHMET, TC_AHMET[-4:]):
+            assert value not in token
 
 
 class TestRemovedEndpoints:

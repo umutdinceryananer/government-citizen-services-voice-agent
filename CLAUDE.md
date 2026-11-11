@@ -36,7 +36,7 @@ ElevenLabs Workflow (visual routing):
     → Failure → Auth Retry (GPT-4o-mini) → back to Collect Identity
 
 Single FastAPI server (agent/server.py, port 8080):
-├─ /v1/chat/completions — Custom LLM proxy (ElevenLabs → LangGraph → SSE)
+├─ /v1/chat/completions — Custom LLM proxy (ElevenLabs → LangGraph → SSE; Bearer CUSTOM_LLM_SECRET)
 ├─ /auth/verify/webhook — Identity verification for the dispatch tool (Bearer PLATFORM_WEBHOOK_SECRET)
 ├─ /applications*       — Application status (X-Internal-Key)
 ├─ /appointments/*      — Appointment endpoints (X-Internal-Key; /appointments/slots/* public)
@@ -57,8 +57,8 @@ Single FastAPI server (agent/server.py, port 8080):
   deploy.py         — Programmatic agent deploy to ElevenLabs (conversation config, workflow preserved)
   graph.py          — LangGraph StateGraph definition
   logging_config.py — PII redaction logging
-  session_token.py  — issue(citizen_id, conversation_id) / verify(token, conversation_id=None) → claims | None; HMAC-SHA256 under SESSION_TOKEN_SECRET, 1h TTL
-  server.py         — Custom LLM proxy + mounted gov API (/v1/chat/completions SSE, circuit breaker)
+  session_token.py  — issue(subject_id, ttl_seconds=900) / verify(token) → citizen_id | None; format <citizen_id>.<expires_unix>.<hex HMAC-SHA256> under SESSION_TOKEN_SECRET
+  server.py         — Custom LLM proxy (Bearer CUSTOM_LLM_SECRET, identity only from SESSION_TOKEN in system prompt, profile from DB) + mounted gov API (/v1/chat/completions SSE, circuit breaker)
   state.py          — AgentState TypedDict (incl. node detail tracking fields)
 /api                — Government backend (mounted into agent/server.py)
   auth.py           — POST /auth/verify/webhook only (platform bearer secret, AttemptLimiter 3/15min per conversation + caller, generic failure, audit per attempt, session_token); matches tc_last4_hash + DOB + father initial, exactly one match
@@ -78,9 +78,10 @@ Single FastAPI server (agent/server.py, port 8080):
   insights.py       — LLM-powered recommendation engine (GPT-4o + ElevenLabs docs RAG)
 /data               — citizens.db (SQLite, gitignored), knowledge_base/ (40 docs + manifest.json)
 /docs               — auth_flow.md, conversation_flow.md
-/tests              — Unit, integration, edge case, and live API tests (370 tests)
+/tests              — Unit, integration, edge case, and live API tests (399 tests)
+  test_custom_llm_auth.py — Custom LLM endpoint: 401 without secret, spoofed prompt/extra_body never authenticates, token-only identity (FakeGraph records graph input)
   test_auth.py      — Auth webhook: 403 secret, 429 limits, identical failures, audit rows without factors, token, PII safety
-  test_session_token.py — token round trip, expiry, tampering, wrong secret, conversation binding
+  test_session_token.py — token format, expiry, every single-character change rejected, wrong secret
   test_core_system.py — Comprehensive core system tests (104 tests, all product endings)
   test_api_security.py — API key guards: 403 without/wrong key, admin-only erasure, public routes, nodes pass key (60 tests)
   test_identity_hashing.py — keyed_hash, no plain SHA-256 in api/, seed → webhook auth for all 23 citizens, non-seed citizen auth, ambiguous match (44 tests)
@@ -124,7 +125,9 @@ Single FastAPI server (agent/server.py, port 8080):
 - New citizen-data routes go on the guarded `router` in api/services.py or api/handoff.py; only static/read-only info goes on `public_router` / `guest_router`
 - Hash identifiers only with `api.crypto.keyed_hash()` — never `hashlib.sha256` (a test enforces that only api/crypto.py imports hashlib). New Citizen rows need both `tc_kimlik_hash` and `tc_last4_hash`
 - `load_dotenv()` is called once in `agent/graph.py` — not in individual nodes
-- Tests: `python -m pytest tests/ -v` (370 tests collected)
+- Tests: `python -m pytest tests/ -v` (399 tests collected)
+- Custom LLM tests send `CUSTOM_LLM_AUTH` headers; authenticated turns put `SESSION_TOKEN=<session_token.issue(id)>` in a system message and point `api.models.SessionLocal` at the test DB
+- Never derive identity from prompt text or `elevenlabs_extra_body` — only `session_token.verify()` on the SESSION_TOKEN line
 - Auth webhook tests must send `PLATFORM_AUTH` headers and a `conversation_id`; conftest resets the in-memory `attempt_limiter` before every test
 - Test DB: in-memory SQLite via conftest.py, audit log cleaned per test
 - Test API keys: conftest.py sets INTERNAL_API_KEY / ADMIN_API_KEY / ID_HASH_PEPPER to fixed test values (TEST_INTERNAL_KEY / TEST_ADMIN_KEY / TEST_ID_HASH_PEPPER) — API test clients must send the keys
@@ -152,7 +155,8 @@ cp .env.example .env
 #          INTERNAL_API_KEY, ADMIN_API_KEY (required — gov API refuses all citizen-data requests without INTERNAL_API_KEY),
 #          ID_HASH_PEPPER (required, >= 32 chars — auth fails without it),
 #          PLATFORM_WEBHOOK_SECRET (same value goes into the ElevenLabs dispatch tool header),
-#          SESSION_TOKEN_SECRET (>= 32 chars)
+#          SESSION_TOKEN_SECRET (>= 32 chars),
+#          CUSTOM_LLM_SECRET (same value as the custom LLM API key in ElevenLabs)
 # Generate keys: python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 # 3. Seed the citizen database
@@ -204,8 +208,8 @@ make test-live         # Live API + simulation tests
 - Auth method: TC Kimlik last 4 digits + DOB + father's name initial (STT-friendly)
 - Webhook: POST /auth/verify/webhook — 200 + session_token on success, 401 on any failure (one generic message, TR/EN), 429 when locked, 403 without the platform secret
 - Dispatch tool (manual dashboard config, see docs/auth_flow.md): header `Authorization: Bearer <PLATFORM_WEBHOOK_SECRET>` (workspace secret / secret__ variable), body `conversation_id` ← {{system__conversation_id}}, `caller_number` ← {{system__caller_id}}, optional `language`; assignment response.session_token → {{session_token}}
-- Dynamic variables: first_name, application_ref, application_status injected into system prompt by ElevenLabs
-- Dynamic variables extracted from system prompt every turn for persistent auth state
+- Dynamic variables: first_name, application_ref, application_status injected into system prompt by ElevenLabs — for speech only
+- Auth state per turn comes only from the `SESSION_TOKEN={{session_token}}` line in custom LLM node prompts (verified with agent.session_token; profile loaded from DB). Custom LLM settings: API key = workspace secret holding CUSTOM_LLM_SECRET (manual, docs/auth_flow.md)
 - Workflow configured via dashboard (tool node requires dashboard webhook config), deploy script preserves workflow
 
 ### What Works Now (e2e tested via dashboard):
@@ -222,7 +226,7 @@ make test-live         # Live API + simulation tests
 - ✅ Document request with type detection — detects document type from conversation history
 - ✅ Clarifying questions for ambiguous requests
 - ✅ Multi-intent in single conversation — status check → appointment → document → complaint transitions
-- ✅ 370 tests (104 core system + auth webhook + session token + services + API security + identity hashing + edge cases + schemas + logging)
+- ✅ 399 tests (104 core system + auth webhook + session token + custom LLM auth + services + API security + identity hashing + edge cases + schemas + logging)
 - ✅ 31 manual voice e2e test scenarios documented
 
 ### Twilio Phone Integration (ISSUE-15B) — IN PROGRESS
@@ -278,7 +282,18 @@ make test-live         # Live API + simulation tests
 - No schema change (no DB reset needed beyond ISSUE-45)
 - Pending manual step: ElevenLabs dispatch tool header, body fields and session_token assignment (docs/auth_flow.md). Until done, the live webhook returns 403/422
 
+### Custom LLM Endpoint Auth (ISSUE-47) — COMPLETE
+- /v1/chat/completions and /chat/completions require `Authorization: Bearer <CUSTOM_LLM_SECRET>` (`require_custom_llm_secret`, 401 + WWW-Authenticate, fail closed). Rejections log header names and auth scheme only — used to confirm what ElevenLabs actually sends (could not be checked live: no ElevenLabs credits)
+- Removed the `Vatandasin adi` / `Vatandas ID` / `Basvuru numarasi` / `Basvuru durumu` regexes and the `elevenlabs_extra_body` auth_status/citizen_profile trust path (`_extract_auth_state`) — both let a crafted request act as any citizen
+- Identity only from `SESSION_TOKEN=<token>` in system messages → `session_token.verify` → `_load_citizen_profile(citizen_id)` from DB (first name, gender, last-name initial, applications, latest application_ref/status). Unknown citizen or missing SESSION_TOKEN_SECRET → unauthenticated, call continues
+- Token is redacted (`SESSION_TOKEN=[redacted]`) from system messages before they reach the graph / LLM provider
+- session_token.py reshaped to the ISSUE-47 spec: `<citizen_id>.<expires_unix>.<hex HMAC>`, `issue(subject_id, ttl_seconds=900)`, `verify(token) → citizen_id | None`. No longer bound to a conversation (the ISSUE-46 v1 format was)
+- `[NODE:xxx]` parsing kept (routing/logging only)
+- Pending manual steps (docs/auth_flow.md): custom LLM API key = workspace secret; `SESSION_TOKEN={{session_token}}` line in every post-auth custom LLM node prompt (not in native-LLM nodes)
+
 ### Technical Debt
+- agent/deploy.py writes `custom_llm` as `{url, model}` only — a deploy may clear the API key set in the dashboard; re-check after deploying (or extend deploy with the secret reference)
+- Session token lives 15 min (spec): a call that runs longer after auth loses authenticated state mid-call
 - docs/auth_flow.md data-handling table says DOB and last name are stored "Hashed"; they are stored in plaintext in the citizens table
 - POST /twilio/inbound (api/twilio_webhook.py) is unguarded and returns first name + citizen_id for a known phone number — needs ElevenLabs/Twilio webhook auth (secret header or signature), out of ISSUE-44 scope
 - Rate limit not enforced: slowapi Limiter(default_limits=["60/minute"]) is configured in agent/server.py, but there is no SlowAPIMiddleware and no @limiter.limit decorator, so no route is limited (verified: 80 rapid requests → 80× 200). The auth webhook has its own attempt limit since ISSUE-46

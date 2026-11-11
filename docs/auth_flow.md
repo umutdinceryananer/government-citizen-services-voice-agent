@@ -91,7 +91,7 @@ Reference: [Designing Secure Caller Identity Authentication Flows for Voice Agen
 - **Limits attempts server-side** — 3 failures per `conversation_id` and per keyed hash of `caller_number` within 15 minutes, then 429. In-memory and per process (demo); production needs a shared store such as Redis
 - **Reveals nothing** — one generic failure message (TR/EN) whether the ID is unknown, the date is wrong or the initial is wrong
 - **Audits every attempt** — `auth_audit_log` row with conversation id, attempt number, outcome and category (`format`, `no_match`, `locked`), plus the keyed hash of the citizen id on success. Never the factors
-- **Returns a signed session token** — `session_token` (agent/session_token.py, HMAC-SHA256, bound to the conversation, 1 hour) next to `citizen_profile`
+- **Returns a signed session token** — `session_token` (agent/session_token.py: `<citizen_id>.<expires_unix>.<hex HMAC-SHA256>`, 15 minutes) next to `citizen_profile`
 
 | Status | Meaning |
 |--------|---------|
@@ -105,6 +105,15 @@ Reference: [Designing Secure Caller Identity Authentication Flows for Voice Agen
 1. **Header:** `Authorization: Bearer <PLATFORM_WEBHOOK_SECRET>`. Store the value as a workspace secret, or as a dynamic variable with the `secret__` prefix — whichever the tool editor offers for headers. Secret variables are used in headers only and are never sent to the LLM.
 2. **Body fields:** `conversation_id` from `{{system__conversation_id}}`, `caller_number` from `{{system__caller_id}}`. Optional: `language` (`tr` / `en`, LLM-filled from the conversation; defaults to `tr`) so failure messages match the call language.
 3. **Assignment:** `response.session_token` → dynamic variable `session_token`.
+
+### Custom LLM Configuration (manual, in the dashboard)
+
+The Custom LLM endpoint (`/v1/chat/completions`) trusts only the session token for identity — never names, IDs or application data in the prompt.
+
+1. **API key:** in the agent's custom LLM settings, set the API key to a workspace secret holding `CUSTOM_LLM_SECRET`. The server expects `Authorization: Bearer <value>` and returns 401 otherwise. If real calls are rejected, the server's warning log lists the header names the platform sent (never values).
+2. **Prompt line:** in the prompt of every custom LLM node after authentication, add `SESSION_TOKEN={{session_token}}`. Use the normal dynamic variable, not `secret__` — the token has to reach the server through the prompt. Leave it out of nodes that use a native LLM, which would send it to that model provider.
+3. Prompt lines showing the name or application data may stay for speech; the server no longer uses them for identity.
+4. **Re-check after `python -m agent.deploy`:** the deploy script writes the custom LLM block with only `url` and `model`, which may clear the API key set in the dashboard.
 
 ## Authentication Methods (original design)
 

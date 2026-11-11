@@ -12,15 +12,17 @@ Reference:
     https://elevenlabs.io/blog/practical-guide-open-source-agent-frameworks-and-elevenagents
 """
 
+import hmac
 import json
 import os
+import re
 import time
 import uuid
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from pydantic import BaseModel
@@ -181,12 +183,17 @@ def _init_gov_db():
             "INTERNAL_API_KEY is not set — government API will refuse every "
             "citizen-data request, so service nodes cannot reach it"
         )
+    if not os.getenv("CUSTOM_LLM_SECRET"):
+        logger.warning(
+            "CUSTOM_LLM_SECRET is not set — /v1/chat/completions will refuse "
+            "every request, so ElevenLabs falls back to its backup LLM"
+        )
     if not os.getenv("PLATFORM_WEBHOOK_SECRET"):
         logger.warning(
             "PLATFORM_WEBHOOK_SECRET is not set — /auth routes will refuse every "
             "request, so callers cannot authenticate"
         )
-    for check in (lambda: keyed_hash("startup-check"), lambda: session_token.issue(0, "startup-check")):
+    for check in (lambda: keyed_hash("startup-check"), lambda: session_token.issue(0)):
         try:
             check()
         except RuntimeError as e:
@@ -253,13 +260,94 @@ def _extract_conversation_id(request: ChatCompletionRequest) -> str:
     return f"local-{uuid.uuid4().hex[:12]}"
 
 
-def _extract_auth_state(request: ChatCompletionRequest) -> tuple[str, dict | None]:
-    """Extract auth status and citizen profile from extra body."""
-    if request.elevenlabs_extra_body:
-        auth_status = request.elevenlabs_extra_body.get("auth_status", "unauthenticated")
-        profile = request.elevenlabs_extra_body.get("citizen_profile")
-        return auth_status, profile
-    return "unauthenticated", None
+# --- Caller authentication ---
+
+def require_custom_llm_secret(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> None:
+    """Allow only ElevenLabs: Authorization: Bearer <CUSTOM_LLM_SECRET>.
+
+    CUSTOM_LLM_SECRET is the API key set in the agent's custom LLM settings.
+    Fails closed (401) when the secret is unset.
+    """
+    expected = os.getenv("CUSTOM_LLM_SECRET", "")
+    token = None
+    if authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer":
+            token = value.strip()
+    if expected and token and hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
+        return
+
+    # Header names and the auth scheme only — never values. ElevenLabs does not
+    # document which header its custom LLM API key produces; if real calls are
+    # rejected, this line shows what the platform actually sent.
+    logger.warning(
+        f"Custom LLM request rejected | secret_configured={bool(expected)} | "
+        f"auth_scheme={(authorization or '').partition(' ')[0] or '-'} | "
+        f"headers={sorted(request.headers.keys())}"
+    )
+    raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Bearer"})
+
+
+# Identity comes only from a signed session token (agent/session_token.py),
+# carried as a `SESSION_TOKEN=<token>` line in the custom LLM node prompts.
+# Names, IDs and application data in the prompt are for speech only.
+SESSION_TOKEN_RE = re.compile(r"SESSION_TOKEN=(\S+)")
+
+
+def _citizen_id_from_token(system_text: str) -> int | None:
+    """Return the citizen id from the first valid SESSION_TOKEN in the system prompt."""
+    try:
+        for candidate in SESSION_TOKEN_RE.findall(system_text):
+            citizen_id = session_token.verify(candidate)
+            if citizen_id is not None:
+                return citizen_id
+    except RuntimeError as e:  # SESSION_TOKEN_SECRET missing — fail closed, keep the call alive
+        logger.error(f"{e} — treating caller as unauthenticated")
+    return None
+
+
+def _redact_session_token(text: str) -> str:
+    """Keep the token out of messages handed to the graph (and on to the LLM provider)."""
+    return SESSION_TOKEN_RE.sub("SESSION_TOKEN=[redacted]", text)
+
+
+def _load_citizen_profile(citizen_id: int) -> dict | None:
+    """Build the citizen profile from the database — never from prompt text."""
+    from api.models import Application, Citizen, SessionLocal
+
+    db = SessionLocal()
+    try:
+        citizen = db.get(Citizen, citizen_id)
+        if citizen is None:
+            return None
+        applications = (
+            db.query(Application)
+            .filter(Application.citizen_id == citizen_id)
+            .order_by(Application.id.desc())
+            .all()
+        )
+        latest = applications[0] if applications else None
+        return {
+            "citizen_id": citizen.id,
+            "first_name": citizen.first_name,
+            "last_name_initial": citizen.last_name[0] + "***",
+            "gender": citizen.gender,
+            "language_preference": citizen.language_preference,
+            "application_ref": latest.application_ref if latest else "",
+            "application_status": latest.status if latest else "",
+            "applications": [
+                {"application_ref": a.application_ref, "service_type": a.service_type, "status": a.status}
+                for a in applications
+            ],
+        }
+    except Exception as e:
+        logger.error(f"Citizen profile lookup failed | citizen_id={citizen_id} | {e}")
+        return None
+    finally:
+        db.close()
 
 
 def _extract_language(request: ChatCompletionRequest) -> str:
@@ -324,12 +412,11 @@ async def _level1_fallback(messages: list, language: str):
 
 # --- Endpoint ---
 
-@app.post("/v1/chat/completions")
-@app.post("/chat/completions")
+@app.post("/v1/chat/completions", dependencies=[Depends(require_custom_llm_secret)])
+@app.post("/chat/completions", dependencies=[Depends(require_custom_llm_secret)])
 async def chat_completions(request: ChatCompletionRequest):
     """OpenAI-compatible chat completions endpoint for ElevenLabs Custom LLM."""
     conversation_id = _extract_conversation_id(request)
-    auth_status, citizen_profile = _extract_auth_state(request)
     language = _extract_language(request)
 
     # Language switching is handled by ElevenLabs' native language_detection
@@ -338,12 +425,19 @@ async def chat_completions(request: ChatCompletionRequest):
     logger.info(f"Custom LLM request | conv={conversation_id} | messages={len(request.messages)} | lang={language}")
     if request.elevenlabs_extra_body:
         logger.info(f"Extra body: {request.elevenlabs_extra_body}")
-    # Log system prompt and extract dynamic variables
-    system_prompt_content = ""
-    for msg in request.messages[:2]:
-        if msg.role == "system":
-            system_prompt_content = msg.content or ""
-            logger.info(f"System prompt length: {len(system_prompt_content)}")
+    system_prompt_content = "\n".join(m.content or "" for m in request.messages if m.role == "system")
+    logger.info(f"System prompt length: {len(system_prompt_content)}")
+
+    # Only a valid signed session token authenticates the caller.
+    auth_status, citizen_profile = "unauthenticated", None
+    token_citizen_id = _citizen_id_from_token(system_prompt_content)
+    if token_citizen_id is not None:
+        citizen_profile = _load_citizen_profile(token_citizen_id)
+        if citizen_profile:
+            auth_status = "authenticated"
+            logger.info(f"Authenticated via session token | conv={conversation_id} | citizen_id={token_citizen_id}")
+        else:
+            logger.warning(f"Session token for unknown citizen | conv={conversation_id} | citizen_id={token_citizen_id}")
 
     # Convert request messages to LangGraph format
     lc_messages = []
@@ -354,52 +448,16 @@ async def chat_completions(request: ChatCompletionRequest):
         elif msg.role == "assistant":
             lc_messages.append(AIMessage(content=content))
         elif msg.role == "system":
-            lc_messages.append(SystemMessage(content=content))
-
-    # Extract citizen profile from system prompt dynamic variables.
-    # ElevenLabs injects {{first_name}} etc. into system prompt after
-    # successful auth via workflow dispatch tool. This is checked on
-    # EVERY turn so authenticated state persists across the conversation.
-    import re
+            lc_messages.append(SystemMessage(content=_redact_session_token(content)))
 
     # Extract workflow node from "Specific goal" in system prompt.
     # ElevenLabs injects each subagent's additional_prompt as "Specific goal".
-    # We use [NODE:xxx] markers to route directly to the right LangGraph node.
+    # [NODE:xxx] markers give routing and logging context only — never identity.
     workflow_node = None
-    if system_prompt_content:
-        node_match = re.search(r'\[NODE:(\w+)\]', system_prompt_content)
-        if node_match:
-            workflow_node = node_match.group(1)
-            logger.info(f"Workflow node detected: {workflow_node}")
-
-        # Extract citizen profile from dynamic variables
-        name_match = re.search(r'Vatandasin adi:\s*(\w+)', system_prompt_content)
-        id_match = re.search(r'Vatandas ID:\s*(\d+)', system_prompt_content)
-        ref_match = re.search(r'Basvuru numarasi:\s*([\w-]+)', system_prompt_content)
-        status_match = re.search(r'Basvuru durumu:\s*(\w+)', system_prompt_content)
-
-        if name_match:
-            auth_status = "authenticated"
-            _citizen_id = int(id_match.group(1)) if id_match else None
-            citizen_profile = {
-                "first_name": name_match.group(1),
-                "citizen_id": _citizen_id,
-                "application_ref": ref_match.group(1) if ref_match else "",
-                "application_status": status_match.group(1) if status_match else "",
-                "gender": "M",  # default, overridden below if DB available
-            }
-            # Look up gender from DB
-            if _citizen_id:
-                try:
-                    from api.models import Citizen, SessionLocal
-                    _gdb = SessionLocal()
-                    _cit = _gdb.query(Citizen).filter(Citizen.id == _citizen_id).first()
-                    if _cit and hasattr(_cit, "gender"):
-                        citizen_profile["gender"] = _cit.gender
-                    _gdb.close()
-                except Exception:
-                    pass
-            logger.info(f"Authenticated via dynamic variables: {citizen_profile}")
+    node_match = re.search(r'\[NODE:(\w+)\]', system_prompt_content)
+    if node_match:
+        workflow_node = node_match.group(1)
+        logger.info(f"Workflow node detected: {workflow_node}")
 
     # Detect post-auth first turn: if many messages (>8) and last user
     # message is an auth artifact (single letter, short number), find the
