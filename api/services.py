@@ -3,6 +3,11 @@ Government services API endpoints.
 
 Provides application status lookup, appointment booking,
 document requests, and service catalog.
+
+Access (see api/security.py):
+- public_router — read-only catalog + slot lookup, no key
+- router        — citizen data, X-Internal-Key (LangGraph nodes only)
+- admin_router  — GDPR erasure, X-Admin-Key (operators only, never the voice flow)
 """
 
 import uuid
@@ -14,10 +19,13 @@ from sqlalchemy.orm import Session
 
 from agent.logging_config import get_logger
 from api.models import Application, Appointment, Citizen, DocumentRequest, Office, get_db
+from api.security import require_admin_key, require_internal_key
 
 logger = get_logger(__name__)
 
-router = APIRouter(tags=["services"])
+public_router = APIRouter(tags=["services"])
+router = APIRouter(tags=["services"], dependencies=[Depends(require_internal_key)])
+admin_router = APIRouter(tags=["admin"], dependencies=[Depends(require_admin_key)])
 
 
 # --- Response models ---
@@ -155,7 +163,7 @@ def _generate_slots_for_office(
     return slots
 
 
-@router.get("/appointments/slots/{service_type}", response_model=list[SlotResponse])
+@public_router.get("/appointments/slots/{service_type}", response_model=list[SlotResponse])
 def get_available_slots(service_type: str, db: Session = Depends(get_db)):
     """Return available appointment slots for a service type.
 
@@ -408,7 +416,7 @@ def request_document(request: DocumentRequestCreate, db: Session = Depends(get_d
     )
 
 
-@router.delete("/citizens/{citizen_id}")
+@admin_router.delete("/citizens/{citizen_id}")
 def delete_citizen_data(citizen_id: int, db: Session = Depends(get_db)):
     """GDPR Article 17 — Right to erasure.
 
@@ -441,7 +449,7 @@ def delete_citizen_data(citizen_id: int, db: Session = Depends(get_db)):
     }
 
 
-@router.get("/services", response_model=list[ServiceInfo])
+@public_router.get("/services", response_model=list[ServiceInfo])
 def list_services():
     """Return catalog of available government services."""
     return SERVICES_CATALOG

@@ -38,9 +38,12 @@ ElevenLabs Workflow (visual routing):
 Single FastAPI server (agent/server.py, port 8080):
 ├─ /v1/chat/completions — Custom LLM proxy (ElevenLabs → LangGraph → SSE)
 ├─ /auth/*              — Government auth endpoints (mounted from api/)
-├─ /appointments/*      — Appointment endpoints (mounted from api/)
-├─ /documents/*         — Document request endpoints (mounted from api/)
-├─ /services            — Service catalog (mounted from api/)
+├─ /applications*       — Application status (X-Internal-Key)
+├─ /appointments/*      — Appointment endpoints (X-Internal-Key; /appointments/slots/* public)
+├─ /documents/*         — Document request endpoints (X-Internal-Key)
+├─ /handoff             — Handoff audit log (X-Internal-Key); /guest/info public
+├─ /citizens/{id}       — GDPR erasure (X-Admin-Key only — never the voice flow)
+├─ /services            — Service catalog (public)
 └─ /health              — Health check + circuit breaker status
 ```
 
@@ -58,10 +61,11 @@ Single FastAPI server (agent/server.py, port 8080):
   state.py          — AgentState TypedDict (incl. node detail tracking fields)
 /api                — Government backend (mounted into agent/server.py)
   auth.py           — POST /auth/verify/tc-kimlik, /auth/verify/app-ref, /auth/verify/webhook
-  handoff.py        — POST /handoff, POST /guest/info
+  handoff.py        — router (internal key): POST /handoff; guest_router (public): POST /guest/info
   models.py         — SQLAlchemy models (Citizen, Application, AuthAuditLog, Appointment, DocumentRequest, ConversationLog)
   seed_data.py      — 23 citizen records + 26 applications + 5 appointments + 3 doc requests seeder
-  services.py       — GET /applications/{ref}, GET /applications, POST /appointments, DELETE /appointments/{id}, POST /documents/request, GET /documents/{citizen_id}, GET /services
+  security.py       — require_internal_key (X-Internal-Key) / require_admin_key (X-Admin-Key) dependencies, hmac.compare_digest, fail closed
+  services.py       — router (internal key): GET /applications/{ref}, GET /applications, POST /appointments, GET /appointments/{citizen_id}, DELETE /appointments/{id}, POST /documents/request, GET /documents/{citizen_id}; public_router: GET /services, GET /appointments/slots/{service_type}; admin_router: DELETE /citizens/{id}
   server.py         — Standalone FastAPI app (for independent testing)
 /rag                — RAG pipeline
   chunker.py        — Document chunking (header-based + size overlap)
@@ -72,8 +76,9 @@ Single FastAPI server (agent/server.py, port 8080):
   insights.py       — LLM-powered recommendation engine (GPT-4o + ElevenLabs docs RAG)
 /data               — citizens.db (SQLite, gitignored), knowledge_base/ (40 docs + manifest.json)
 /docs               — auth_flow.md, conversation_flow.md
-/tests              — Unit, integration, edge case, and live API tests (231 tests)
+/tests              — Unit, integration, edge case, and live API tests (293 tests)
   test_core_system.py — Comprehensive core system tests (104 tests, all product endings)
+  test_api_security.py — API key guards: 403 without/wrong key, admin-only erasure, public routes, nodes pass key (60 tests)
   conftest.py       — Shared test DB setup with per-test audit log cleanup
   voice_e2e_test_roadmap.md — 31 manual voice test scenarios
   /eval             — Automated conversation evaluation (planned)
@@ -98,6 +103,7 @@ Single FastAPI server (agent/server.py, port 8080):
 - **Graceful degradation** — Level 0: full LangGraph, Level 1: direct OpenAI (circuit breaker after 3 failures, 60s cooldown), Level 2: ElevenLabs native fallback (backup_llm_config)
 - **Sentence-level SSE streaming** — responses split by sentence with delays for TTS processing
 - **STT-friendly auth** — last 4 digits + DOB + father initial instead of full 11-digit TC Kimlik
+- **Shared-secret guard on the public gov API** — gov routers share the ngrok-exposed app, so citizen-data routes require X-Internal-Key (only LangGraph nodes hold it) and GDPR erasure requires a separate X-Admin-Key. Fail closed: unset key → every request 403. Chosen over moving the API off the public app to keep the single-server/single-tunnel setup
 
 ## README Policy
 - README contains the FULL target project structure — not just what exists today
@@ -108,10 +114,13 @@ Single FastAPI server (agent/server.py, port 8080):
 - PII redaction is automatic — TC Kimlik (11 digits) and DOB patterns are masked before log output
 - Use `.env` for secrets, never commit API keys
 - System prompts live in versioned files under `/agent/prompts/`
-- Shared node utilities in `agent/nodes/utils.py` (mark_completed)
+- Shared node utilities in `agent/nodes/utils.py` (mark_completed, gov_api_request)
+- Nodes call the government API only through `gov_api_request()` — it attaches X-Internal-Key; never call `httpx.get/post` against the API directly
+- New citizen-data routes go on the guarded `router` in api/services.py or api/handoff.py; only static/read-only info goes on `public_router` / `guest_router`
 - `load_dotenv()` is called once in `agent/graph.py` — not in individual nodes
-- Tests: `python -m pytest tests/ -v` (231 tests collected)
+- Tests: `python -m pytest tests/ -v` (293 tests collected)
 - Test DB: in-memory SQLite via conftest.py, audit log cleaned per test
+- Test API keys: conftest.py sets INTERNAL_API_KEY / ADMIN_API_KEY to fixed test values (TEST_INTERNAL_KEY / TEST_ADMIN_KEY) — API test clients must send them
 - Service nodes report `service_node_name`, `tool_chain_triggered`, `api_calls_count` to state for analytics
 
 ## User Preferences (for Claude)
@@ -132,7 +141,9 @@ pip install -r requirements.txt
 
 # 2. Configure environment
 cp .env.example .env
-# Fill in: ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID, OPENAI_API_KEY
+# Fill in: ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID, OPENAI_API_KEY,
+#          INTERNAL_API_KEY, ADMIN_API_KEY (required — gov API refuses all citizen-data requests without INTERNAL_API_KEY)
+# Generate keys: python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 # 3. Seed the citizen database
 python -m api.seed_data
@@ -197,7 +208,7 @@ make test-live         # Live API + simulation tests
 - ✅ Document request with type detection — detects document type from conversation history
 - ✅ Clarifying questions for ambiguous requests
 - ✅ Multi-intent in single conversation — status check → appointment → document → complaint transitions
-- ✅ 231 tests (104 core system + auth + services + edge cases + schemas + logging)
+- ✅ 293 tests (104 core system + auth + services + API security + edge cases + schemas + logging)
 - ✅ 31 manual voice e2e test scenarios documented
 
 ### Twilio Phone Integration (ISSUE-15B) — IN PROGRESS
@@ -226,7 +237,18 @@ make test-live         # Live API + simulation tests
 - Merged test_graph.py (36 duplicate tests) into test_core_system.py
 - 231 total tests, 104 in comprehensive core system suite
 
+### API Route Protection (ISSUE-44) — COMPLETE
+- Problem: gov API routers share the ngrok-exposed app with /v1/chat/completions; no route checked the caller, so anyone with the URL could read/book/cancel/erase citizen data and write fake handoff audit rows
+- api/security.py: `require_internal_key` (X-Internal-Key vs INTERNAL_API_KEY) and `require_admin_key` (X-Admin-Key vs ADMIN_API_KEY), hmac.compare_digest, 403 on missing/wrong key, fail closed when env var unset
+- Router split: services.py → router (internal) / public_router (GET /services, GET /appointments/slots/*) / admin_router (DELETE /citizens/{id}); handoff.py → router (POST /handoff, internal) / guest_router (POST /guest/info, public)
+- All 7 API-calling nodes go through `gov_api_request()` in agent/nodes/utils.py (per-node API_BASE constants removed); escalate now logs a warning when the handoff audit call is refused
+- agent/server.py logs a startup warning when INTERNAL_API_KEY is unset
+- tests/test_api_security.py — 60 tests (12 skip without OPENAI_API_KEY because importing agent.server / escalate builds ChatOpenAI)
+- Not done (optional, from spec): moving the gov API off the public app entirely
+
 ### Technical Debt
+- POST /twilio/inbound (api/twilio_webhook.py) is unguarded and returns first name + citizen_id for a known phone number — needs ElevenLabs/Twilio webhook auth (secret header or signature), out of ISSUE-44 scope
+- Rate limit not enforced: slowapi Limiter(default_limits=["60/minute"]) is configured in agent/server.py, but there is no SlowAPIMiddleware and no @limiter.limit decorator, so no route is limited (verified: 80 rapid requests → 80× 200). /auth/verify/* also has no server-side lockout (attempt_number is client-supplied)
 - Workflow backward edges don't trigger with Custom LLM — LangGraph handles topic changes via intent_classify as fallback
 - Service Router must use GPT-4o (not Custom LLM) for workflow edge transitions
 - Buffer words after auth ("kontrol ediyorum") — causes workflow edge issues, deferred

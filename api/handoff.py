@@ -1,8 +1,8 @@
 """
 Human handoff and guest mode endpoints.
 
-POST /handoff — logs transfer event, returns handoff confirmation
-GET  /guest/info — limited FAQ access without authentication
+POST /handoff    — logs transfer event, returns handoff confirmation (X-Internal-Key)
+POST /guest/info — limited FAQ access without authentication (public)
 """
 
 from datetime import UTC, datetime
@@ -13,10 +13,14 @@ from sqlalchemy.orm import Session
 
 from agent.logging_config import get_logger
 from api.models import AuthAuditLog, get_db
+from api.security import require_internal_key
 
 logger = get_logger(__name__)
 
-router = APIRouter(tags=["handoff"])
+# /handoff writes to the audit log — LangGraph nodes only.
+router = APIRouter(tags=["handoff"], dependencies=[Depends(require_internal_key)])
+# /guest/info is static FAQ text — open to unauthenticated callers.
+guest_router = APIRouter(tags=["handoff"])
 
 
 # --- Request / Response models ---
@@ -186,7 +190,7 @@ def request_handoff(
     )
 
 
-@router.post("/guest/info", response_model=GuestInfoResponse)
+@guest_router.post("/guest/info", response_model=GuestInfoResponse)
 def guest_info(request: GuestInfoRequest):
     """Answer general questions without authentication."""
     logger.info(f"Guest query | language={request.language}")

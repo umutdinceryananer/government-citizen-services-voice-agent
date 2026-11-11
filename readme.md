@@ -264,7 +264,7 @@ This is a demo, but the architecture is designed with production deployment in m
 - **Horizontal scaling**: FastAPI backend and LangGraph agent are stateless per-request, can scale behind a load balancer
 - **Knowledge base updates**: re-indexing pipeline allows document updates without downtime
 - **Multi-tenant architecture**: the same system can serve multiple government agencies with isolated knowledge bases and authentication backends
-- **Compliance**: CORS policy, security headers (OWASP), rate limiting, GDPR right to erasure, PII redaction, SHA-256 hashed credentials, audit trail. ElevenLabs platform holds SOC 2 Type II, ISO 27001, HIPAA, and GDPR certifications ([elevenlabs.io](https://compliance.elevenlabs.io/))
+- **Compliance**: CORS policy, security headers (OWASP), rate limiting, API-key guard on every citizen-data route (separate admin key for erasure), GDPR right to erasure, PII redaction, SHA-256 hashed credentials, audit trail. ElevenLabs platform holds SOC 2 Type II, ISO 27001, HIPAA, and GDPR certifications ([elevenlabs.io](https://compliance.elevenlabs.io/))
 - **Observability**: ConversationLog tracks intent, timing, RAG scores, tool chains, and API calls per request
 
 ## Capabilities Demonstrated
@@ -275,7 +275,7 @@ This project demonstrates the following technical and design patterns:
 2. **Deterministic workflow design**: auth gating via dispatch tool plus subagent isolation (no LLM in the auth decision path), LLM condition edges for service routing, backward edges for auth retry. Demonstrates how to combine deterministic guarantees with LLM flexibility.
 3. **Enterprise public sector use case**: voice AI applied to a massive, underserved market with real compliance and security requirements.
 4. **Security-first design**: caller authentication as a core architectural concern. KVKK compliance, PII redaction, SHA-256 hashed credentials, audit trails.
-5. **Full-stack ownership**: voice layer, agent logic, API integrations, knowledge base, analytics dashboard, and 231-test suite, all built end-to-end.
+5. **Full-stack ownership**: voice layer, agent logic, API integrations, knowledge base, analytics dashboard, and 293-test suite, all built end-to-end.
 6. **Multilingual capability**: English plus Turkish with auto-detection and dynamic voice switching. Architecture extensible to additional languages.
 7. **Production resilience**: graceful degradation across three levels with circuit breaker pattern and health monitoring.
 8. **Measurable analytics**: 9-page dashboard with Sankey flow visualization, node-level timing, tool chain analysis, and knowledge gap detection.
@@ -334,7 +334,7 @@ python -m agent.deploy --dry-run  # Preview config without deploying
 # Run analytics dashboard
 python -m streamlit run dashboard/app.py
 
-# Run tests (231 tests)
+# Run tests (293 tests)
 python -m pytest tests/ -v
 ```
 
@@ -377,6 +377,7 @@ Government-Citizen-Services-Voice-Agent/
 │   ├── auth.py                        # Identity verification, webhook, TC Kimlik, app ref methods
 │   ├── handoff.py                     # Escalation logging + guest mode FAQ
 │   ├── services.py                    # Application, appointment, document, service catalog endpoints
+│   ├── security.py                    # X-Internal-Key / X-Admin-Key guards for citizen-data routes
 │   ├── models.py                      # SQLAlchemy models (Citizen, Application, Appointment, DocumentRequest, ConversationLog, AuthAuditLog)
 │   └── seed_data.py                   # 23 citizens + 26 applications + 5 appointments + 3 doc requests
 ├── rag/                               # RAG pipeline
@@ -394,13 +395,14 @@ Government-Citizen-Services-Voice-Agent/
 │   ├── auth_flow.md                   # Authentication state diagram
 │   ├── conversation_flow.md           # Conversation flow documentation
 │   └── langgraph_value.md             # LangGraph capabilities and voice test scenarios
-├── tests/                             # 231 tests
+├── tests/                             # 293 tests
 │   ├── conftest.py                    # Shared test DB setup, per-test audit log cleanup
 │   ├── test_core_system.py            # Comprehensive core system tests (104 tests, all product endings)
 │   ├── test_auth.py                   # Authentication flow tests (20 tests)
 │   ├── test_services.py               # Government API endpoint tests
 │   ├── test_edge_cases.py             # TC Kimlik normalization, date parsing edge cases
 │   ├── test_handoff.py                # Escalation and handoff tests
+│   ├── test_api_security.py           # API key guards on government routes (internal + admin keys)
 │   ├── test_schemas.py                # System tool schema tests
 │   ├── test_logging.py                # PII redaction filter tests
 │   ├── test_tc_kimlik.py              # TC Kimlik validator tests

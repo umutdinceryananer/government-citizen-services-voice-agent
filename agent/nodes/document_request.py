@@ -11,11 +11,9 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from agent.state import AgentState
 from agent.logging_config import get_logger
-from agent.nodes.utils import mark_completed, get_honorific
+from agent.nodes.utils import mark_completed, get_honorific, gov_api_request
 
 logger = get_logger(__name__)
-
-API_BASE = "http://localhost:8080"
 
 DOCUMENT_TYPES = {
     "birth_certificate": {
@@ -78,7 +76,7 @@ def _request_via_api(citizen_id: int, document_type: str) -> dict | None:
             "citizen_id": citizen_id,
             "document_type": document_type,
         }
-        r = httpx.post(f"{API_BASE}/documents/request", json=payload, timeout=5.0)
+        r = gov_api_request("POST", "/documents/request", json=payload)
         if r.status_code == 200:
             return r.json()
         logger.warning(f"Document API returned {r.status_code}: {r.text}")

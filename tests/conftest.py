@@ -6,6 +6,8 @@ so tests never see each other's writes. Seed data (Ahmet, Fatma)
 is always available because it's committed before tests start.
 """
 
+import os
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -14,6 +16,13 @@ from sqlalchemy.pool import StaticPool
 from api.models import Application, Base, Citizen, AuthAuditLog, Office, get_db
 from api.server import app
 from api.seed_data import generate_valid_tc, hash_tc
+
+# Keys for the guarded government routes (api/security.py). Assigned (not
+# setdefault) so tests never depend on a developer's .env values.
+TEST_INTERNAL_KEY = "test-internal-key"
+TEST_ADMIN_KEY = "test-admin-key"
+os.environ["INTERNAL_API_KEY"] = TEST_INTERNAL_KEY
+os.environ["ADMIN_API_KEY"] = TEST_ADMIN_KEY
 
 # Single in-memory DB shared across all test modules
 test_engine = create_engine(

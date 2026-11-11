@@ -39,7 +39,7 @@ An AI-powered voice agent built on **ElevenLabs Conversational AI** that resolve
 | Supported languages | English + Turkish (auto-detection) |
 | LangGraph nodes | 11 (intent classify, 9 service nodes, service router) |
 | Knowledge base | 40 documents, 219 chunks, 5 service categories |
-| Test coverage | 231 automated tests, 39 manual voice test scenarios |
+| Test coverage | 293 automated tests, 39 manual voice test scenarios |
 | Service types | 4 (passport, ID card, driver's license, civil registry) |
 
 ## Why ElevenLabs

@@ -2,7 +2,29 @@
 Shared utilities for graph nodes.
 """
 
+import os
 from datetime import datetime
+
+import httpx
+
+# Government API is mounted on the same server as the Custom LLM proxy
+# (agent/server.py), so nodes reach it over localhost.
+GOV_API_BASE = "http://localhost:8080"
+
+# Must match api/security.py — kept as a literal so nodes don't import the API package.
+INTERNAL_KEY_HEADER = "X-Internal-Key"
+
+
+def gov_api_request(method: str, path: str, *, timeout: float = 5.0, **kwargs) -> httpx.Response:
+    """Call the government API with the internal key attached.
+
+    Every node that talks to the government API goes through here, so the
+    X-Internal-Key header is set in one place. The key is read per call so a
+    missing key shows up as a 403 (logged by the caller) instead of a crash.
+    Raises httpx.RequestError on network failure, same as httpx itself.
+    """
+    headers = {INTERNAL_KEY_HEADER: os.getenv("INTERNAL_API_KEY", "")}
+    return httpx.request(method, f"{GOV_API_BASE}{path}", headers=headers, timeout=timeout, **kwargs)
 
 
 def format_date_spoken(date_str: str) -> str:

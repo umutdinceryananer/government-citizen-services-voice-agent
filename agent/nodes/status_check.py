@@ -19,12 +19,10 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from agent.state import AgentState
 from agent.logging_config import get_logger
-from agent.nodes.utils import mark_completed, get_honorific
+from agent.nodes.utils import mark_completed, get_honorific, gov_api_request
 from rag.retriever import search, format_context_tts
 
 logger = get_logger(__name__)
-
-API_BASE = "http://localhost:8080"
 
 SERVICE_NAMES_TR = {
     "passport": "pasaport",
@@ -68,7 +66,7 @@ def _rag_lookup(query: str, language: str, category: str | None = None) -> str:
 def _fetch_all_applications(citizen_id: int) -> list[dict]:
     """Call government API for all citizen applications."""
     try:
-        r = httpx.get(f"{API_BASE}/applications", params={"citizen_id": citizen_id}, timeout=5.0)
+        r = gov_api_request("GET", "/applications", params={"citizen_id": citizen_id})
         if r.status_code == 200:
             return r.json()
         logger.warning(f"Applications API returned {r.status_code} for citizen {citizen_id}")
@@ -81,7 +79,7 @@ def _fetch_all_applications(citizen_id: int) -> list[dict]:
 def _fetch_status(application_ref: str) -> dict | None:
     """Call government API for single application status."""
     try:
-        r = httpx.get(f"{API_BASE}/applications/{application_ref}", timeout=5.0)
+        r = gov_api_request("GET", f"/applications/{application_ref}")
         if r.status_code == 200:
             return r.json()
         logger.warning(f"Status API returned {r.status_code} for {application_ref}")

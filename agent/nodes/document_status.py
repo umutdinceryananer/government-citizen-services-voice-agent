@@ -9,17 +9,15 @@ from langchain_core.messages import AIMessage
 
 from agent.state import AgentState
 from agent.logging_config import get_logger
-from agent.nodes.utils import mark_completed, get_honorific
+from agent.nodes.utils import mark_completed, get_honorific, gov_api_request
 
 logger = get_logger(__name__)
-
-API_BASE = "http://localhost:8080"
 
 
 def _fetch_document_requests(citizen_id: int) -> list[dict]:
     """Call government API for citizen's document requests."""
     try:
-        r = httpx.get(f"{API_BASE}/documents/{citizen_id}", timeout=5.0)
+        r = gov_api_request("GET", f"/documents/{citizen_id}")
         if r.status_code == 200:
             return r.json()
         return []

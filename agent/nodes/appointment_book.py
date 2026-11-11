@@ -17,11 +17,9 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from agent.state import AgentState
 from agent.logging_config import get_logger
-from agent.nodes.utils import mark_completed, get_honorific, format_date_spoken, format_time_spoken
+from agent.nodes.utils import mark_completed, get_honorific, format_date_spoken, format_time_spoken, gov_api_request
 
 logger = get_logger(__name__)
-
-API_BASE = "http://localhost:8080"
 
 SERVICE_TYPES = {
     "passport": {
@@ -86,7 +84,7 @@ def _detect_service_type(messages: list, language: str) -> str | None:
 def _fetch_appointments(citizen_id: int) -> list[dict]:
     """Call government API to get existing appointments."""
     try:
-        r = httpx.get(f"{API_BASE}/appointments/{citizen_id}", timeout=5.0)
+        r = gov_api_request("GET", f"/appointments/{citizen_id}")
         if r.status_code == 200:
             return r.json()
         return []
@@ -97,7 +95,7 @@ def _fetch_appointments(citizen_id: int) -> list[dict]:
 def _fetch_available_slots(service_type: str) -> list[dict]:
     """Fetch available appointment slots from API."""
     try:
-        r = httpx.get(f"{API_BASE}/appointments/slots/{service_type}", timeout=5.0)
+        r = gov_api_request("GET", f"/appointments/slots/{service_type}")
         if r.status_code == 200:
             return r.json()
         return []
@@ -113,7 +111,7 @@ def _book_via_api(citizen_id: int, service_type: str, preferred_date: str | None
             "service_type": service_type,
             "preferred_date": preferred_date,
         }
-        r = httpx.post(f"{API_BASE}/appointments", json=payload, timeout=5.0)
+        r = gov_api_request("POST", "/appointments", json=payload)
         if r.status_code == 200:
             return r.json(), None
 

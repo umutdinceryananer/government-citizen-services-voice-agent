@@ -1656,3 +1656,38 @@ Add detailed LangGraph node analytics page to dashboard. Track per-node performa
 - [x] Tool chain triggers tracked (e.g. status → RAG)
 - [x] API call counts per node visible
 - [x] Page accessible from sidebar
+
+---
+
+# ISSUE-44: Protect Government API Routes
+
+## Module
+Security
+
+## Priority
+P0 (high severity)
+
+## Dependencies
+ISSUE-13, ISSUE-14
+
+## Description
+agent/server.py mounts the government API routers on the same public app as the Custom LLM endpoint, and ngrok exposes that app. No route checked who was calling: anyone with the URL could read any citizen's applications, appointments and document requests, book or cancel appointments, request documents, erase a citizen (DELETE /citizens/{id}), or write fake handoff events into the audit log.
+
+Fix: shared-secret header check. Citizen-data routes require X-Internal-Key (INTERNAL_API_KEY), sent only by LangGraph nodes. GDPR erasure requires a separate X-Admin-Key (ADMIN_API_KEY) so the voice flow can never call it. Keys are compared with hmac.compare_digest; an unset key refuses every request (fail closed).
+
+## Tasks
+- [x] api/security.py — `require_internal_key` / `require_admin_key` dependencies (403 on missing/wrong key, fail closed when env var unset)
+- [x] Router-level dependency on every route in api/services.py and api/handoff.py, except GET /services, GET /appointments/slots/{service_type}, POST /guest/info (split into public_router / guest_router)
+- [x] DELETE /citizens/{citizen_id} moved to admin_router guarded by ADMIN_API_KEY
+- [x] Shared `gov_api_request()` helper in agent/nodes/utils.py — all 7 API-calling nodes (status_check, appointment_book, appointment_list, appointment_cancel, document_request, document_status, escalate) send X-Internal-Key through it
+- [x] New routers mounted in both agent/server.py and api/server.py; startup warning when INTERNAL_API_KEY is unset
+- [x] INTERNAL_API_KEY= and ADMIN_API_KEY= added to .env.example
+- [ ] Optional (stronger): stop exposing the government API on the public app — call service functions in-process from nodes, or run api/server.py on localhost only
+
+## Acceptance Criteria
+- [x] Existing tests in test_services.py, test_handoff.py, test_core_system.py send the internal key and still pass
+- [x] Each protected route returns 403 without the key and with a wrong key
+- [x] DELETE /citizens/{citizen_id} returns 403 with only the internal key, works with the admin key
+- [x] The three read-only routes answer without a key
+- [x] The public app (agent/server.py) enforces the same rules
+- [x] Every node helper passes the key check end-to-end (tests/test_api_security.py, 60 tests)

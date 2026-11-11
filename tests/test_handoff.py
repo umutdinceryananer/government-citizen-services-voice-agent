@@ -7,10 +7,11 @@ from fastapi.testclient import TestClient
 
 from api.models import AuthAuditLog
 from api.server import app
-from tests.conftest import TestSession
+from tests.conftest import TEST_INTERNAL_KEY, TestSession
 
 
-client = TestClient(app)
+# Acts as the LangGraph nodes do: every request carries the internal key.
+client = TestClient(app, headers={"X-Internal-Key": TEST_INTERNAL_KEY})
 
 
 class TestHandoff:

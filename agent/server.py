@@ -13,6 +13,7 @@ Reference:
 """
 
 import json
+import os
 import time
 import uuid
 
@@ -147,15 +148,24 @@ async def security_headers(request, call_next):
 # Mount government API routers on the same server.
 # Single port = single ngrok tunnel = ElevenLabs can reach both
 # Custom LLM (/v1/chat/completions) and Government API (/auth, /appointments, etc.)
+# Because this app is public, citizen-data routers require X-Internal-Key
+# (sent by LangGraph nodes) and erasure requires X-Admin-Key — see api/security.py.
 from api.auth import router as auth_router
-from api.handoff import router as handoff_router
-from api.services import router as services_router
+from api.handoff import router as handoff_router, guest_router
+from api.services import (
+    router as services_router,
+    public_router as services_public_router,
+    admin_router as services_admin_router,
+)
 from api.twilio_webhook import router as twilio_router
 from api.models import init_db
 
 app.include_router(auth_router)
 app.include_router(handoff_router)
+app.include_router(guest_router)
 app.include_router(services_router)
+app.include_router(services_public_router)
+app.include_router(services_admin_router)
 app.include_router(twilio_router)
 
 # Ensure DB tables exist on startup
@@ -164,6 +174,11 @@ app.include_router(twilio_router)
 @app.on_event("startup")
 def _init_gov_db():
     init_db()
+    if not os.getenv("INTERNAL_API_KEY"):
+        logger.warning(
+            "INTERNAL_API_KEY is not set — government API will refuse every "
+            "citizen-data request, so service nodes cannot reach it"
+        )
 
 
 # --- Request model (OpenAI Chat Completions format) ---

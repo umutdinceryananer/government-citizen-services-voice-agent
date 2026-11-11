@@ -16,17 +16,15 @@ import json
 import os
 import uuid
 
-import httpx
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 
 from agent.state import AgentState
 from agent.logging_config import get_logger
-from agent.nodes.utils import mark_completed, get_honorific
+from agent.nodes.utils import mark_completed, get_honorific, gov_api_request
 
 logger = get_logger(__name__)
 
-API_BASE = "http://localhost:8080"
 _TRANSFER_NUMBER = "+905001234567"
 _ENABLE_TRANSFER = os.getenv("ENABLE_PHONE_TRANSFER", "false").lower() == "true"
 
@@ -72,11 +70,13 @@ def _generate_operator_summary(messages: list, language: str) -> str:
 def _log_handoff(session_id: str, reason: str, summary: str, language: str):
     """Log handoff event via API."""
     try:
-        httpx.post(f"{API_BASE}/handoff", json={
+        r = gov_api_request("POST", "/handoff", json={
             "session_id": session_id or f"escalate-{uuid.uuid4().hex[:8]}",
             "reason": reason,
             "language": language,
         }, timeout=3.0)
+        if r.status_code != 200:
+            logger.warning(f"Handoff API returned {r.status_code} — handoff not audited")
     except Exception as e:
         logger.warning(f"Could not log handoff: {e}")
 

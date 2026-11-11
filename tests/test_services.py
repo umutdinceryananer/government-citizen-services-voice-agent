@@ -10,10 +10,12 @@ from fastapi.testclient import TestClient
 
 from api.server import app
 from api.models import Citizen, Appointment, DocumentRequest
-from tests.conftest import TestSession
+from tests.conftest import TEST_ADMIN_KEY, TEST_INTERNAL_KEY, TestSession
 
 
-client = TestClient(app)
+# Acts as the LangGraph nodes do: every request carries the internal key.
+client = TestClient(app, headers={"X-Internal-Key": TEST_INTERNAL_KEY})
+ADMIN = {"X-Admin-Key": TEST_ADMIN_KEY}
 
 
 class TestApplicationStatus:
@@ -211,7 +213,7 @@ class TestGDPRErasure:
 
     def test_delete_citizen_removes_all_data(self):
         # Citizen 2 (Fatma) exists in test DB
-        r = client.delete("/citizens/2")
+        r = client.delete("/citizens/2", headers=ADMIN)
         assert r.status_code == 200
         data = r.json()
         assert data["citizen_id"] == 2
@@ -222,5 +224,5 @@ class TestGDPRErasure:
         assert r2.status_code == 404
 
     def test_delete_nonexistent_citizen_404(self):
-        r = client.delete("/citizens/99999")
+        r = client.delete("/citizens/99999", headers=ADMIN)
         assert r.status_code == 404

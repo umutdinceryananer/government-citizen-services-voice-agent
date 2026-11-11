@@ -10,11 +10,9 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from agent.state import AgentState
 from agent.logging_config import get_logger
-from agent.nodes.utils import mark_completed, get_honorific, format_date_spoken, format_time_spoken
+from agent.nodes.utils import mark_completed, get_honorific, format_date_spoken, format_time_spoken, gov_api_request
 
 logger = get_logger(__name__)
-
-API_BASE = "http://localhost:8080"
 
 SERVICE_NAMES_TR = {
     "passport": "pasaport",
@@ -45,7 +43,7 @@ def _normalize(text: str) -> str:
 def _fetch_appointments(citizen_id: int) -> list[dict]:
     """Call government API for citizen's appointments."""
     try:
-        r = httpx.get(f"{API_BASE}/appointments/{citizen_id}", timeout=5.0)
+        r = gov_api_request("GET", f"/appointments/{citizen_id}")
         if r.status_code == 200:
             return r.json()
         return []
@@ -57,7 +55,7 @@ def _fetch_appointments(citizen_id: int) -> list[dict]:
 def _cancel_appointment(appointment_id: int) -> bool:
     """Call government API to cancel an appointment."""
     try:
-        r = httpx.delete(f"{API_BASE}/appointments/{appointment_id}", timeout=5.0)
+        r = gov_api_request("DELETE", f"/appointments/{appointment_id}")
         return r.status_code == 200
     except httpx.RequestError as e:
         logger.error(f"Appointment cancel API unreachable: {e}")
